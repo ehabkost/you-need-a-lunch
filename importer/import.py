@@ -2,10 +2,11 @@
 """Lunch Money importer — import YNAB data into Lunch Money.
 
 Usage:
-  ./run.sh ./importer/import.py --data data/brl init-mapping
-  ./run.sh ./importer/import.py --data data/brl audit
-  ./run.sh ./importer/import.py --data data/brl import          # dry-run (not yet implemented)
-  ./run.sh ./importer/import.py --data data/brl import --apply  # apply    (not yet implemented)
+  ./run.sh ./importer/import.py --data data/cad init-mapping   # generate mapping.yaml
+  ./run.sh ./importer/import.py --data data/cad show-mapping   # display mapping table (no API)
+  ./run.sh ./importer/import.py --data data/cad audit          # strict YNAB-first audit
+  ./run.sh ./importer/import.py --data data/cad import         # dry-run (not yet implemented)
+  ./run.sh ./importer/import.py --data data/cad import --apply # apply    (not yet implemented)
 """
 import argparse
 import json
@@ -506,6 +507,156 @@ def cmd_audit(data_dir: Path, client: LMClient):
         print("✓ Audit passed — all LM entities are mapped to YNAB.")
 
 
+# ── show-mapping ─────────────────────────────────────────────────────────────
+
+USE_COLOR = sys.stdout.isatty()
+
+def _c(code): return f"\033[{code}m" if USE_COLOR else ""
+RESET = _c(0); BOLD = _c(1); DIM = _c(2)
+GREEN = _c(32); YELLOW = _c(33); RED = _c(31); CYAN = _c(36)
+
+
+def _col(text: str, width: int, right=False) -> str:
+    import re
+    from wcwidth import wcswidth
+    stripped = re.sub(r"\033\[[0-9;]*m", "", text)
+    pad = max(0, width - (wcswidth(stripped) or len(stripped)))
+    return (" " * pad + text) if right else (text + " " * pad)
+
+
+def cmd_show_mapping(data_dir: Path):
+    """Display the current mapping in a readable table (no API calls)."""
+    mapping = Mapping.load(data_dir)
+
+    ynab_accounts: list[dict] = load_json(data_dir, "accounts")
+    ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
+    meta: dict = load_json(data_dir, "export_metadata")
+
+    ynab_acc_by_id = {a["id"]: a for a in ynab_accounts}
+    ynab_groups = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
+    ynab_cats_by_group: dict[str, list[dict]] = {
+        g["id"]: [c for c in g.get("categories", []) if not c["deleted"] and not c["internal"]]
+        for g in ynab_groups
+    }
+
+    raw = mapping.raw
+
+    # ── accounts ──────────────────────────────────────────────────────────────
+    print(BOLD + f"\nACCOUNTS — {meta['budget_name']} ({meta['currency']})\n" + RESET)
+    print(DIM + "  " + _col("YNAB Account", 36) + _col("YNAB Type", 12)
+          + _col("LM Type", 9) + _col("LM ID", 9) + "Match" + RESET)
+    print(DIM + "  " + "─" * 78 + RESET)
+
+    on_budget  = [a for a in ynab_accounts if not a["deleted"] and     a["on_budget"]]
+    off_budget = [a for a in ynab_accounts if not a["deleted"] and not a["on_budget"]]
+
+    def print_account_group(label: str, accounts: list[dict]):
+        if not accounts:
+            return
+        print(f"\n  {BOLD}{CYAN}{label}{RESET}")
+        for a in accounts:
+            entry = raw.get("accounts", {}).get(a["id"])
+            if not isinstance(entry, dict):
+                status = RED + "✗ not in mapping" + RESET
+                lm_type = lm_id = method = "—"
+            elif entry.get("lm_type") == "excluded":
+                status = DIM + "[excluded]" + RESET
+                lm_type = "excluded"; lm_id = method = "—"
+            elif entry.get("lm_id") is None:
+                status = YELLOW + "⚠ needs mapping" + RESET
+                lm_type = entry.get("lm_type") or "?"
+                lm_id = RED + "null" + RESET
+                method = "—"
+            else:
+                status = GREEN + "✓" + RESET
+                lm_type = entry.get("lm_type", "?")
+                lm_id = str(entry["lm_id"])
+                method = entry.get("match_method") or "—"
+
+            flags = []
+            if a.get("closed"):               flags.append("closed")
+            if a.get("direct_import_linked"): flags.append("sync")
+            flag_str = f" ({','.join(flags)})" if flags else ""
+            name = a["name"] + flag_str
+
+            print("  " + _col(status + " " + name, 40) + _col(a["type"], 12)
+                  + _col(lm_type, 9) + _col(lm_id, 9) + method)
+
+    print_account_group("On Budget",  on_budget)
+    print_account_group("Off Budget", off_budget)
+
+    # unmapped lm_excluded accounts
+    excl = raw.get("lm_excluded", {})
+    if excl.get("manual_accounts") or excl.get("plaid_accounts"):
+        print(f"\n  {BOLD}LM accounts with no YNAB counterpart (excluded){RESET}")
+        for lid in excl.get("manual_accounts", []):
+            print(f"  {DIM}  [excluded manual]  id={lid}{RESET}")
+        for lid in excl.get("plaid_accounts", []):
+            print(f"  {DIM}  [excluded plaid]   id={lid}{RESET}")
+
+    # ── categories ────────────────────────────────────────────────────────────
+    print(BOLD + f"\nCATEGORIES\n" + RESET)
+    print(DIM + "  " + _col("YNAB Category", 40) + _col("LM ID", 9) + "Status" + RESET)
+    print(DIM + "  " + "─" * 64 + RESET)
+
+    groups_map = raw.get("category_groups", {})
+    cats_map   = raw.get("categories", {})
+
+    total_groups = total_cats = matched_groups = matched_cats = 0
+
+    for g in ynab_groups:
+        gid = g["id"]
+        lm_gid = groups_map.get(gid)
+        total_groups += 1
+
+        if lm_gid is None:
+            g_status = YELLOW + "to create" + RESET
+            g_lm = RED + "null" + RESET
+        else:
+            g_status = GREEN + "matched" + RESET
+            g_lm = str(lm_gid)
+            matched_groups += 1
+
+        print(f"\n  {BOLD}{CYAN}{_col(g['name'], 40)}{RESET}{_col(g_lm, 9)}{g_status}")
+
+        for c in ynab_cats_by_group.get(gid, []):
+            cid = c["id"]
+            lm_cid = cats_map.get(cid)
+            total_cats += 1
+            if lm_cid is None:
+                c_status = YELLOW + "to create" + RESET
+                c_lm = RED + "null" + RESET
+            else:
+                c_status = GREEN + "matched" + RESET
+                c_lm = str(lm_cid)
+                matched_cats += 1
+            print(f"    {_col(c['name'], 38)}{_col(c_lm, 9)}{c_status}")
+
+    if excl.get("categories"):
+        print(f"\n  {BOLD}LM categories with no YNAB counterpart (excluded){RESET}")
+        for lid in excl["categories"]:
+            print(f"  {DIM}  [excluded]  id={lid}{RESET}")
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    acc_entries = raw.get("accounts", {})
+    matched_acc = sum(1 for v in acc_entries.values()
+                      if isinstance(v, dict) and v.get("lm_id") is not None)
+    needs_acc   = sum(1 for v in acc_entries.values()
+                      if isinstance(v, dict) and v.get("lm_id") is None
+                      and v.get("lm_type") != "excluded")
+
+    print(f"\n{BOLD}Summary{RESET}")
+    print(f"  Accounts:        {GREEN}{matched_acc} matched{RESET}"
+          + (f", {RED}{needs_acc} need mapping{RESET}" if needs_acc else ""))
+    print(f"  Category groups: {GREEN}{matched_groups}/{total_groups} matched{RESET}"
+          + (f", {YELLOW}{total_groups - matched_groups} to create{RESET}"
+             if total_groups > matched_groups else ""))
+    print(f"  Categories:      {GREEN}{matched_cats}/{total_cats} matched{RESET}"
+          + (f", {YELLOW}{total_cats - matched_cats} to create{RESET}"
+             if total_cats > matched_cats else ""))
+    print()
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -515,6 +666,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init-mapping", help="Generate initial mapping.yaml from YNAB export + LM state")
+    sub.add_parser("show-mapping", help="Display current mapping as a table (no API calls)")
     sub.add_parser("audit", help="Verify every LM entity maps to a YNAB entity")
     p_import = sub.add_parser("import", help="Import YNAB data into LM (dry-run by default)")
     p_import.add_argument("--apply", action="store_true", help="Apply changes (default: dry-run)")
@@ -524,6 +676,11 @@ def main():
     if not data_dir.is_dir():
         print(f"Error: {data_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    # show-mapping reads only local files — no token needed
+    if args.cmd == "show-mapping":
+        cmd_show_mapping(data_dir)
+        return
 
     token = get_env("LUNCHMONEY_API_TOKEN")
     client = LMClient(token)
