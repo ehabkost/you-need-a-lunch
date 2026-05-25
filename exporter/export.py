@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """YNAB data exporter — writes all budget data to JSON files.
 
+Automatically does a delta update if a checkpoint exists, otherwise a full export.
+
 Usage:
-  ./ynab-run.sh ./exporter/export.py                    # list budgets
-  ./ynab-run.sh ./exporter/export.py --budget ID        # export to data/<budget-name>/
-  ./ynab-run.sh ./exporter/export.py --budget ID --out ./my-dir
+  ./ynab-run.sh ./exporter/export.py                      # list budgets
+  ./ynab-run.sh ./exporter/export.py --budget ID          # export (auto: delta or full)
+  ./ynab-run.sh ./exporter/export.py --budget ID --full   # force full export
+  ./ynab-run.sh ./exporter/export.py --budget ID --out DIR
 """
 import argparse
 import json
@@ -17,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_URL = "https://api.ynab.com/v1"
+CHECKPOINT_FILE = "checkpoint.json"
 
 
 def get_env(name):
@@ -27,13 +31,17 @@ def get_env(name):
     return value
 
 
+# ── API client ────────────────────────────────────────────────────────────────
+
 class YNABClient:
     def __init__(self, token):
         self._token = token
         self.request_count = 0
 
-    def get(self, path, *, allow_404=False):
+    def get(self, path, *, since: int | None = None, allow_404=False):
         url = f"{BASE_URL}{path}"
+        if since is not None:
+            url += f"?last_knowledge_of_server={since}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._token}"})
         try:
             with urllib.request.urlopen(req) as resp:
@@ -44,7 +52,7 @@ class YNABClient:
                 wait = int(e.headers.get("Retry-After", 60))
                 print(f"    rate limited — waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
-                return self.get(path, allow_404=allow_404)
+                return self.get(path, since=since, allow_404=allow_404)
             if e.code == 404 and allow_404:
                 return None
             body = e.read().decode()
@@ -52,68 +60,154 @@ class YNABClient:
             sys.exit(1)
 
 
-def save(out_dir: Path, name: str, data):
+# ── checkpoint ────────────────────────────────────────────────────────────────
+
+def load_checkpoint(out_dir: Path) -> dict:
+    path = out_dir / CHECKPOINT_FILE
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def save_checkpoint(out_dir: Path, checkpoint: dict):
+    path = out_dir / CHECKPOINT_FILE
+    path.write_text(json.dumps(checkpoint, indent=2))
+
+
+# ── file helpers ──────────────────────────────────────────────────────────────
+
+def load_json(out_dir: Path, name: str) -> list:
+    path = out_dir / f"{name}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return []
+
+
+def save_json(out_dir: Path, name: str, data):
     path = out_dir / f"{name}.json"
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     count = f"{len(data)} records" if isinstance(data, list) else "saved"
     print(f"  → {path.name}  ({count})")
 
 
-def export_budget(client: YNABClient, budget_id: str, budget: dict, out_dir: Path):
+def merge_by_id(existing: list, delta: list, key="id") -> tuple[list, int, int]:
+    """Upsert delta records into existing list by key. Returns (merged, updated, added)."""
+    index = {r[key]: r for r in existing}
+    updated = added = 0
+    for record in delta:
+        if record[key] in index:
+            updated += 1
+        else:
+            added += 1
+        index[record[key]] = record
+    return list(index.values()), updated, added
+
+
+# ── export helpers ────────────────────────────────────────────────────────────
+
+def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *, allow_404=False):
+    """Fetch a simple list endpoint, merge with existing, update checkpoint."""
+    since = checkpoint.get(ck_key)
+    resp = client.get(path, since=since, allow_404=allow_404)
+    if resp is None:
+        print(f"  (not available)")
+        return
+
+    records = resp["data"].get(data_key, [])
+    server_knowledge = resp["data"].get("server_knowledge")
+
+    if since is not None:
+        existing = load_json(out_dir, name)
+        merged, updated, added = merge_by_id(existing, records)
+        save_json(out_dir, name, merged)
+        print(f"    {added} added, {updated} updated (was {len(existing)})")
+    else:
+        save_json(out_dir, name, records)
+
+    if server_knowledge is not None:
+        checkpoint[ck_key] = server_knowledge
+
+
+def fetch_months(client, budget_id, out_dir, checkpoint):
+    """Fetch budget months. Delta only re-fetches months whose summaries changed."""
+    since = checkpoint.get("months")
+    resp = client.get(f"/budgets/{budget_id}/months", since=since)
+    changed_summaries = resp["data"]["months"]
+    server_knowledge = resp["data"].get("server_knowledge")
+
+    changed_summaries.sort(key=lambda m: m["month"])
+
+    existing_months = load_json(out_dir, "months")
+    index = {m["month"]: m for m in existing_months}
+
+    if since is not None:
+        print(f"  {len(changed_summaries)} month(s) changed since last sync")
+    else:
+        print(f"  {len(changed_summaries)} months total")
+
+    for i, summary in enumerate(changed_summaries):
+        month_str = summary["month"]
+        label = month_str[:7]
+        suffix = f"({i + 1}/{len(changed_summaries)})" if len(changed_summaries) > 1 else ""
+        print(f"  {label} {suffix}")
+        detail = client.get(f"/budgets/{budget_id}/months/{month_str}")["data"]["month"]
+        index[month_str] = detail
+
+    months = sorted(index.values(), key=lambda m: m["month"])
+    save_json(out_dir, "months", months)
+
+    if server_knowledge is not None:
+        checkpoint["months"] = server_knowledge
+
+
+# ── full export / delta update ────────────────────────────────────────────────
+
+def run_export(client: YNABClient, budget_id: str, budget: dict, out_dir: Path, update: bool):
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = load_checkpoint(out_dir) if update else {}
+
+    if update and not checkpoint:
+        print("No checkpoint found — running full export instead.\n")
 
     print("Accounts...")
-    accounts = client.get(f"/budgets/{budget_id}/accounts")["data"]["accounts"]
-    save(out_dir, "accounts", accounts)
+    fetch_simple(client, f"/budgets/{budget_id}/accounts", "accounts",
+                 out_dir, "accounts", checkpoint, "accounts")
 
     print("Payees...")
-    payees = client.get(f"/budgets/{budget_id}/payees")["data"]["payees"]
-    save(out_dir, "payees", payees)
+    fetch_simple(client, f"/budgets/{budget_id}/payees", "payees",
+                 out_dir, "payees", checkpoint, "payees")
 
     print("Payee locations...")
-    locations = client.get(f"/budgets/{budget_id}/payee_locations")["data"]["payee_locations"]
-    save(out_dir, "payee_locations", locations)
+    # payee_locations does not support delta
+    resp = client.get(f"/budgets/{budget_id}/payee_locations")
+    locations = resp["data"]["payee_locations"]
+    save_json(out_dir, "payee_locations", locations)
 
     print("Categories...")
-    category_groups = client.get(f"/budgets/{budget_id}/categories")["data"]["category_groups"]
-    save(out_dir, "categories", category_groups)
+    fetch_simple(client, f"/budgets/{budget_id}/categories", "category_groups",
+                 out_dir, "categories", checkpoint, "categories")
 
     print("Transactions...")
-    transactions = client.get(f"/budgets/{budget_id}/transactions")["data"]["transactions"]
-    save(out_dir, "transactions", transactions)
+    fetch_simple(client, f"/budgets/{budget_id}/transactions", "transactions",
+                 out_dir, "transactions", checkpoint, "transactions")
 
     print("Scheduled transactions...")
-    scheduled = client.get(f"/budgets/{budget_id}/scheduled_transactions")["data"]["scheduled_transactions"]
-    save(out_dir, "scheduled_transactions", scheduled)
+    fetch_simple(client, f"/budgets/{budget_id}/scheduled_transactions", "scheduled_transactions",
+                 out_dir, "scheduled_transactions", checkpoint, "scheduled_transactions")
 
     print("Budget months...")
-    month_summaries = client.get(f"/budgets/{budget_id}/months")["data"]["months"]
-    # Sort oldest-first so progress is easy to follow
-    month_summaries.sort(key=lambda m: m["month"])
-    months_detail = []
-    for i, summary in enumerate(month_summaries):
-        month_str = summary["month"]  # YYYY-MM-01
-        label = month_str[:7]
-        print(f"  {label}  ({i + 1}/{len(month_summaries)})")
-        detail = client.get(f"/budgets/{budget_id}/months/{month_str}")["data"]["month"]
-        months_detail.append(detail)
-    save(out_dir, "months", months_detail)
+    fetch_months(client, budget_id, out_dir, checkpoint)
 
     print("Money movements...")
-    resp = client.get(f"/budgets/{budget_id}/money_movements", allow_404=True)
-    if resp is not None:
-        movements = resp["data"].get("money_movements", [])
-        save(out_dir, "money_movements", movements)
-    else:
-        print("  (not available for this budget)")
+    fetch_simple(client, f"/budgets/{budget_id}/money_movements", "money_movements",
+                 out_dir, "money_movements", checkpoint, "money_movements", allow_404=True)
 
     print("Money movement groups...")
-    resp = client.get(f"/budgets/{budget_id}/money_movement_groups", allow_404=True)
-    if resp is not None:
-        groups = resp["data"].get("money_movement_groups", [])
-        save(out_dir, "money_movement_groups", groups)
-    else:
-        print("  (not available for this budget)")
+    fetch_simple(client, f"/budgets/{budget_id}/money_movement_groups", "money_movement_groups",
+                 out_dir, "money_movement_groups", checkpoint, "money_movement_groups", allow_404=True)
+
+    save_checkpoint(out_dir, checkpoint)
+    print(f"  → {CHECKPOINT_FILE}  (server_knowledge per resource)")
 
     metadata = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -121,11 +215,14 @@ def export_budget(client: YNABClient, budget_id: str, budget: dict, out_dir: Pat
         "budget_name": budget["name"],
         "currency": budget["currency_format"]["iso_code"],
         "api_requests": client.request_count,
+        "mode": "update" if update and checkpoint else "full",
     }
-    save(out_dir, "export_metadata", metadata)
+    save_json(out_dir, "export_metadata", metadata)
 
     print(f"\nDone. {client.request_count} API requests.")
 
+
+# ── entry point ───────────────────────────────────────────────────────────────
 
 def list_budgets(client: YNABClient):
     budgets = client.get("/budgets")["data"]["budgets"]
@@ -138,6 +235,7 @@ def list_budgets(client: YNABClient):
 def main():
     parser = argparse.ArgumentParser(description="Export YNAB budget data to JSON files.")
     parser.add_argument("--budget", metavar="ID", help="Budget ID to export (omit to list budgets)")
+    parser.add_argument("--full", action="store_true", help="Force full export, ignoring any saved checkpoint")
     parser.add_argument("--out", metavar="DIR", default="data", help="Output base directory (default: data)")
     args = parser.parse_args()
 
@@ -157,10 +255,13 @@ def main():
     slug = budget["name"].lower().replace(" ", "-")
     out_dir = Path(args.out) / slug
 
+    has_checkpoint = (out_dir / CHECKPOINT_FILE).exists() and not args.full
+    mode = "delta update" if has_checkpoint else "full export"
     print(f"Budget:  {budget['name']}  ({budget['currency_format']['iso_code']})")
+    print(f"Mode:    {mode}")
     print(f"Output:  {out_dir}/\n")
 
-    export_budget(client, args.budget, budget, out_dir)
+    run_export(client, args.budget, budget, out_dir, update=has_checkpoint)
 
 
 if __name__ == "__main__":

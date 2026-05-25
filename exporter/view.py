@@ -38,11 +38,18 @@ def fmt(milliunits, formatted_str):
     return colored(formatted_str, DIM)
 
 
-def col(text, width, right=False):
-    """Fixed-width column, stripping ANSI codes for length measurement."""
+def _visible_width(text) -> int:
+    """Terminal display width of text, stripping ANSI codes and measuring Unicode width."""
     import re
-    visible = re.sub(r"\033\[[0-9;]*m", "", text)
-    pad = max(0, width - len(visible))
+    from wcwidth import wcswidth
+    stripped = re.sub(r"\033\[[0-9;]*m", "", text)
+    w = wcswidth(stripped)
+    return w if w >= 0 else len(stripped)
+
+
+def col(text, width, right=False):
+    """Fixed-width column padded to terminal display width."""
+    pad = max(0, width - _visible_width(text))
     if right:
         return " " * pad + text
     return text + " " * pad
