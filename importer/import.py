@@ -15,11 +15,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import re
+
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping
+
+LM_CACHE_FILE = "lm_cache.json"
 
 # ── YNAB account type → LM account type ──────────────────────────────────────
 
@@ -44,6 +48,80 @@ def get_env(name: str) -> str:
 
 def load_json(data_dir: Path, name: str) -> list | dict:
     return json.loads((data_dir / f"{name}.json").read_text())
+
+
+def load_lm_cache(data_dir: Path) -> dict:
+    path = data_dir / LM_CACHE_FILE
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def save_lm_cache(data_dir: Path, manual: list, plaid: list, cats_flat: list):
+    (data_dir / LM_CACHE_FILE).write_text(json.dumps({
+        "manual_accounts": manual,
+        "plaid_accounts":  plaid,
+        "categories":      cats_flat,
+    }, indent=2))
+
+
+def patch_yaml_account(text: str, uuid: str, lm_type: str, lm_id, match_method) -> str:
+    """Update lm_type/lm_id/match_method for one account entry, preserving comments."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line.rstrip() == f'  "{uuid}":':
+            out.append(line)
+            i += 1
+            while i < len(lines) and lines[i].startswith("    "):
+                l = lines[i]
+                if l.startswith("    lm_type:"):
+                    out.append(f"    lm_type: {lm_type}")
+                elif l.startswith("    lm_id:"):
+                    out.append(f"    lm_id: {'null' if lm_id is None else lm_id}")
+                elif l.startswith("    match_method:"):
+                    out.append(f"    match_method: {'null' if not match_method else match_method}")
+                else:
+                    out.append(l)
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return "\n".join(out)
+
+
+def patch_yaml_scalar(text: str, uuid: str, lm_id) -> str:
+    """Update a scalar category/group mapping line: '  "uuid": value'."""
+    val = "null" if lm_id is None else str(lm_id)
+    return re.sub(
+        rf'^(  "{re.escape(uuid)}":\s*)\S+',
+        rf"\g<1>{val}",
+        text,
+        flags=re.MULTILINE,
+    )
+
+
+def remove_from_lm_excluded(text: str, lm_id: int) -> str:
+    """Remove a specific LM ID line from the lm_excluded section."""
+    return re.sub(rf"^  - {lm_id}[ \t]*.*$\n?", "", text, flags=re.MULTILINE)
+
+
+def append_to_lm_excluded(text: str, key: str, lm_id: int) -> str:
+    """Append lm_id to lm_excluded.<key>, handling both '[]' and multi-line forms."""
+    # Handle inline empty list:  key: []  →  key:\n  - id
+    text = re.sub(
+        rf"^(  {key}): \[\]$",
+        rf"\1:\n  - {lm_id}",
+        text, flags=re.MULTILINE,
+    )
+    # Handle multi-line list: insert after "  key:" line
+    text = re.sub(
+        rf"^(  {key}:)$",
+        rf"\1\n  - {lm_id}",
+        text, flags=re.MULTILINE,
+    )
+    return text
 
 
 def normalize(s: str) -> str:
@@ -88,6 +166,12 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
     lm_manual = client.get_manual_accounts()
     lm_plaid = client.get_plaid_accounts()
     lm_cats_raw = client.get_categories()
+
+    lm_cats_flat_for_cache: list[dict] = []
+    for _c in lm_cats_raw:
+        lm_cats_flat_for_cache.append(_c)
+        lm_cats_flat_for_cache.extend(_c.get("children", []))
+    save_lm_cache(data_dir, lm_manual, lm_plaid, lm_cats_flat_for_cache)
 
     # index LM manual accounts by external_id
     lm_manual_by_ext: dict[str, dict] = {}
@@ -137,39 +221,69 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
             lm_a = lm_manual_by_ext[yid]
             entry = {"lm_type": "manual", "lm_id": lm_a["id"], "match_method": "external_id"}
 
-        # 2. direct_import_linked → try to match to plaid account by institution+type
+        # 2. direct_import_linked → try to match to plaid account
         elif a.get("direct_import_linked"):
             ynab_type = a["type"]
             lm_type_equiv = {"creditCard": "credit"}.get(ynab_type, "depository")
-            best_score, best_match = 0.0, None
+            note = (a.get("note") or "").strip()
+
+            # 2a. mask found in YNAB account note → definitive match
+            note_match = None
             for lm_pa in lm_plaid:
-                inst_score = name_similarity(
-                    a.get("name", ""),
-                    lm_pa.get("display_name") or lm_pa.get("name", "")
-                )
-                type_match = 1.0 if lm_pa.get("type", "") == lm_type_equiv else 0.0
-                score = inst_score * 0.7 + type_match * 0.3
-                if score > best_score:
-                    best_score, best_match = score, lm_pa
-            if best_match and best_score >= 0.5:
+                mask = lm_pa.get("mask", "")
+                if mask and mask in note:
+                    note_match = lm_pa
+                    break
+
+            if note_match:
                 entry = {
                     "lm_type": "plaid",
-                    "lm_id": best_match["id"],
-                    "match_method": "name",
-                    "_match_score": round(best_score, 2),
-                    "_lm_mask": best_match.get("mask"),
-                    "_lm_name": best_match.get("display_name") or best_match.get("name"),
+                    "lm_id": note_match["id"],
+                    "match_method": "note_mask",
+                    "_lm_mask": note_match.get("mask"),
+                    "_lm_name": note_match.get("display_name") or note_match.get("name"),
                 }
+
             else:
-                entry = {
-                    "lm_type": "plaid",
-                    "lm_id": None,
-                    "match_method": None,
-                    "_unmatched_plaid_accounts": [
-                        f"id={p['id']} {p.get('institution_name','')} {p.get('name','')} mask={p.get('mask','?')} ({p.get('type','')})"
-                        for p in lm_plaid
-                    ],
-                }
+                # 2b. fall back to name similarity — only auto-fill if very confident
+                best_score, best_match = 0.0, None
+                for lm_pa in lm_plaid:
+                    inst_score = name_similarity(
+                        a.get("name", ""),
+                        lm_pa.get("display_name") or lm_pa.get("name", "")
+                    )
+                    type_match = 1.0 if lm_pa.get("type", "") == lm_type_equiv else 0.0
+                    score = inst_score * 0.7 + type_match * 0.3
+                    if score > best_score:
+                        best_score, best_match = score, lm_pa
+                if best_match and best_score >= 0.9:
+                    entry = {
+                        "lm_type": "plaid",
+                        "lm_id": best_match["id"],
+                        "match_method": "name",
+                        "_match_score": round(best_score, 2),
+                        "_lm_mask": best_match.get("mask"),
+                        "_lm_name": best_match.get("display_name") or best_match.get("name"),
+                    }
+                elif best_match and best_score >= 0.5:
+                    entry = {
+                        "lm_type": "plaid",
+                        "lm_id": None,
+                        "match_method": None,
+                        "_match_score": round(best_score, 2),
+                        "_lm_mask": best_match.get("mask"),
+                        "_lm_name": best_match.get("display_name") or best_match.get("name"),
+                    }
+                else:
+                    entry = {
+                        "lm_type": "plaid",
+                        "lm_id": None,
+                        "match_method": None,
+                        "_unmatched_plaid_accounts": [
+                            f"id={p['id']} {p.get('institution_name','')} {p.get('name','')} mask={p.get('mask','?')} ({p.get('type','')})"
+                            for p in lm_plaid
+                        ],
+                    }
 
         # 3. name match for non-import-linked manual accounts
         else:
@@ -250,8 +364,13 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
                 lines.append(f"  #   {pa}")
             entry_clean = {k: v for k, v in entry.items() if not k.startswith("_")}
         elif entry.get("_lm_name"):
-            score = entry.get("_match_score", 0)
-            confidence = "auto-matched" if score >= 0.8 else "suggested — verify!"
+            method = entry.get("match_method")
+            if method == "note_mask":
+                confidence = "matched by mask in note"
+            elif entry.get("lm_id"):
+                confidence = "auto-matched by name"
+            else:
+                confidence = f"suggested by name (score={entry.get('_match_score','?')}) — verify!"
             lines.append(f"  # LM: {entry['_lm_name']}  mask={entry.get('_lm_mask','?')}  ({confidence})")
             entry_clean = {k: v for k, v in entry.items() if not k.startswith("_")}
         else:
@@ -296,7 +415,14 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
             lines.append(f"  \"{c['id']}\": {v}")
     lines.append("")
 
-    # lm_excluded section — prepopulate with any LM entities not referenced in mapping
+    lines.append("lm_excluded:")
+    lines.append("  manual_accounts: []")
+    lines.append("  plaid_accounts: []")
+    lines.append("  categories: []")
+
+    out_path.write_text("\n".join(lines) + "\n")
+
+    # count LM entities without a YNAB match
     mapped_manual_ids = {
         info["lm_id"] for info in accounts_map.values()
         if isinstance(info, dict) and info.get("lm_type") == "manual" and info.get("lm_id")
@@ -309,31 +435,8 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
 
     orphan_manual = [a["id"] for a in lm_manual if a["id"] not in mapped_manual_ids]
     orphan_plaid  = [a["id"] for a in lm_plaid  if a["id"] not in mapped_plaid_ids]
-    orphan_cats   = [c["id"] for c in lm_cats_flat if c["id"] not in mapped_cat_ids]
+    orphan_cats   = [c["id"] for c in lm_cats_flat_for_cache if c["id"] not in mapped_cat_ids]
 
-    lines.append("# LM entities that have no YNAB counterpart.")
-    lines.append("# Add their IDs here to suppress audit errors, or map them above.")
-    lines.append("lm_excluded:")
-
-    def write_excluded(label: str, ids: list[int], lm_items: list[dict], name_key="name"):
-        items_by_id = {a["id"]: a for a in lm_items}
-        if ids:
-            lines.append(f"  {label}:")
-            for lid in ids:
-                item = items_by_id.get(lid, {})
-                name = item.get(name_key, "?")
-                mask = f"  mask={item['mask']}" if "mask" in item else ""
-                lines.append(f"  - {lid}  # {name}{mask}")
-        else:
-            lines.append(f"  {label}: []")
-
-    write_excluded("manual_accounts", orphan_manual, lm_manual)
-    write_excluded("plaid_accounts",  orphan_plaid,  lm_plaid)
-    write_excluded("categories",      orphan_cats,   lm_cats_flat)
-
-    out_path.write_text("\n".join(lines) + "\n")
-
-    # summary
     auto = sum(1 for v in accounts_map.values() if isinstance(v, dict) and v.get("lm_id"))
     unmatched_acc = sum(1 for v in accounts_map.values() if isinstance(v, dict) and not v.get("lm_id"))
     auto_cat = sum(1 for v in cats_map.values() if v)
@@ -346,7 +449,7 @@ def cmd_init_mapping(data_dir: Path, client: LMClient):
     print(f"  Category groups:  {auto_grp} matched, {unmatched_grp} to create")
     print(f"  Categories:       {auto_cat} matched, {unmatched_cat} to create")
     if orphan_manual or orphan_plaid or orphan_cats:
-        print(f"\n  ⚠ LM has entities not in YNAB — review lm_excluded section:")
+        print(f"\n  ⚠ LM has entities not yet mapped to YNAB — run fix-mapping to resolve:")
         if orphan_manual: print(f"    {len(orphan_manual)} manual account(s)")
         if orphan_plaid:  print(f"    {len(orphan_plaid)} plaid account(s)")
         if orphan_cats:   print(f"    {len(orphan_cats)} category/group(s)")
@@ -527,12 +630,12 @@ def _col(text: str, width: int, right=False) -> str:
 def cmd_show_mapping(data_dir: Path):
     """Display the current mapping in a readable table (no API calls)."""
     mapping = Mapping.load(data_dir)
+    cache = load_lm_cache(data_dir)
 
     ynab_accounts: list[dict] = load_json(data_dir, "accounts")
     ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
     meta: dict = load_json(data_dir, "export_metadata")
 
-    ynab_acc_by_id = {a["id"]: a for a in ynab_accounts}
     ynab_groups = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
     ynab_cats_by_group: dict[str, list[dict]] = {
         g["id"]: [c for c in g.get("categories", []) if not c["deleted"] and not c["internal"]]
@@ -540,121 +643,417 @@ def cmd_show_mapping(data_dir: Path):
     }
 
     raw = mapping.raw
+    excl = raw.get("lm_excluded", {})
+
+    cache_manual = {a["id"]: a for a in cache.get("manual_accounts", [])}
+    cache_plaid  = {a["id"]: a for a in cache.get("plaid_accounts",  [])}
+    cache_cats   = {c["id"]: c for c in cache.get("categories",      [])}
+
+    def lm_acc_name(entry: dict) -> str:
+        lm_id  = entry.get("lm_id")
+        lm_typ = entry.get("lm_type")
+        if lm_id is None:
+            return RED + "(unmatched)" + RESET
+        if lm_typ == "plaid":
+            a = cache_plaid.get(lm_id, {})
+            name = a.get("display_name") or a.get("name") or "?"
+            mask = f" ···{a['mask']}" if a.get("mask") else ""
+            return f"{name}{mask}"
+        if lm_typ == "manual":
+            a = cache_manual.get(lm_id, {})
+            return a.get("name") or "?"
+        return "?"
 
     # ── accounts ──────────────────────────────────────────────────────────────
     print(BOLD + f"\nACCOUNTS — {meta['budget_name']} ({meta['currency']})\n" + RESET)
-    print(DIM + "  " + _col("YNAB Account", 36) + _col("YNAB Type", 12)
-          + _col("LM Type", 9) + _col("LM ID", 9) + "Match" + RESET)
-    print(DIM + "  " + "─" * 78 + RESET)
+    print(DIM + "  " + _col("YNAB Account", 34) + _col("LM Account", 34) + "Match" + RESET)
+    print(DIM + "  " + "─" * 76 + RESET)
 
     on_budget  = [a for a in ynab_accounts if not a["deleted"] and     a["on_budget"]]
     off_budget = [a for a in ynab_accounts if not a["deleted"] and not a["on_budget"]]
 
+    matched_acc = needs_acc = 0
+
     def print_account_group(label: str, accounts: list[dict]):
+        nonlocal matched_acc, needs_acc
         if not accounts:
             return
         print(f"\n  {BOLD}{CYAN}{label}{RESET}")
         for a in accounts:
             entry = raw.get("accounts", {}).get(a["id"])
-            if not isinstance(entry, dict):
-                status = RED + "✗ not in mapping" + RESET
-                lm_type = lm_id = method = "—"
-            elif entry.get("lm_type") == "excluded":
-                status = DIM + "[excluded]" + RESET
-                lm_type = "excluded"; lm_id = method = "—"
-            elif entry.get("lm_id") is None:
-                status = YELLOW + "⚠ needs mapping" + RESET
-                lm_type = entry.get("lm_type") or "?"
-                lm_id = RED + "null" + RESET
-                method = "—"
-            else:
-                status = GREEN + "✓" + RESET
-                lm_type = entry.get("lm_type", "?")
-                lm_id = str(entry["lm_id"])
-                method = entry.get("match_method") or "—"
-
             flags = []
             if a.get("closed"):               flags.append("closed")
             if a.get("direct_import_linked"): flags.append("sync")
             flag_str = f" ({','.join(flags)})" if flags else ""
-            name = a["name"] + flag_str
+            ynab_name = a["name"] + flag_str
 
-            print("  " + _col(status + " " + name, 40) + _col(a["type"], 12)
-                  + _col(lm_type, 9) + _col(lm_id, 9) + method)
+            if not isinstance(entry, dict):
+                status   = RED + "✗" + RESET
+                lm_name  = RED + "(not in mapping)" + RESET
+                method   = ""
+                needs_acc += 1
+            elif entry.get("lm_id") is None:
+                status   = YELLOW + "⚠" + RESET
+                lm_name  = lm_acc_name(entry)
+                method   = ""
+                needs_acc += 1
+            else:
+                status   = GREEN + "✓" + RESET
+                lm_name  = lm_acc_name(entry)
+                method   = DIM + (entry.get("match_method") or "") + RESET
+                matched_acc += 1
+
+            print("  " + _col(status + " " + ynab_name, 38)
+                  + _col(lm_name, 38) + method)
 
     print_account_group("On Budget",  on_budget)
     print_account_group("Off Budget", off_budget)
 
-    # unmapped lm_excluded accounts
-    excl = raw.get("lm_excluded", {})
-    if excl.get("manual_accounts") or excl.get("plaid_accounts"):
-        print(f"\n  {BOLD}LM accounts with no YNAB counterpart (excluded){RESET}")
-        for lid in excl.get("manual_accounts", []):
-            print(f"  {DIM}  [excluded manual]  id={lid}{RESET}")
-        for lid in excl.get("plaid_accounts", []):
-            print(f"  {DIM}  [excluded plaid]   id={lid}{RESET}")
+    # unmapped LM accounts (in cache but not referenced in mapping)
+    referenced_manual = {
+        info["lm_id"] for info in raw.get("accounts", {}).values()
+        if isinstance(info, dict) and info.get("lm_type") == "manual" and info.get("lm_id")
+    }
+    referenced_plaid = {
+        info["lm_id"] for info in raw.get("accounts", {}).values()
+        if isinstance(info, dict) and info.get("lm_type") == "plaid" and info.get("lm_id")
+    }
+    excluded_manual = set(excl.get("manual_accounts", []))
+    excluded_plaid  = set(excl.get("plaid_accounts",  []))
+
+    unmapped_manual = [a for a in cache.get("manual_accounts", [])
+                       if a["id"] not in referenced_manual and a["id"] not in excluded_manual]
+    unmapped_plaid  = [a for a in cache.get("plaid_accounts",  [])
+                       if a["id"] not in referenced_plaid  and a["id"] not in excluded_plaid]
+
+    if unmapped_manual or unmapped_plaid:
+        print(f"\n  {BOLD}{RED}Unmapped LM accounts — run fix-mapping{RESET}")
+        for a in unmapped_manual:
+            print(f"  {RED}⚠ [manual] {a['id']:8}  {a['name']}{RESET}")
+        for a in unmapped_plaid:
+            name = a.get("display_name") or a.get("name", "?")
+            mask = f"  ···{a['mask']}" if a.get("mask") else ""
+            print(f"  {RED}⚠ [plaid]  {a['id']:8}  {name}{mask}{RESET}")
 
     # ── categories ────────────────────────────────────────────────────────────
-    print(BOLD + f"\nCATEGORIES\n" + RESET)
-    print(DIM + "  " + _col("YNAB Category", 40) + _col("LM ID", 9) + "Status" + RESET)
-    print(DIM + "  " + "─" * 64 + RESET)
-
     groups_map = raw.get("category_groups", {})
     cats_map   = raw.get("categories", {})
 
     total_groups = total_cats = matched_groups = matched_cats = 0
 
+    print(BOLD + f"\nCATEGORIES\n" + RESET)
+    print(DIM + "  " + _col("YNAB Category", 36) + _col("LM Category", 30) + "Status" + RESET)
+    print(DIM + "  " + "─" * 76 + RESET)
+
     for g in ynab_groups:
-        gid = g["id"]
+        gid   = g["id"]
         lm_gid = groups_map.get(gid)
         total_groups += 1
 
         if lm_gid is None:
-            g_status = YELLOW + "to create" + RESET
-            g_lm = RED + "null" + RESET
+            g_lm_name = RED + "(to create)" + RESET
+            g_status  = YELLOW + "to create" + RESET
         else:
-            g_status = GREEN + "matched" + RESET
-            g_lm = str(lm_gid)
+            gc = cache_cats.get(lm_gid, {})
+            g_lm_name = GREEN + (gc.get("name") or str(lm_gid)) + RESET
+            g_status  = GREEN + "matched" + RESET
             matched_groups += 1
 
-        print(f"\n  {BOLD}{CYAN}{_col(g['name'], 40)}{RESET}{_col(g_lm, 9)}{g_status}")
+        print(f"\n  {BOLD}{CYAN}{_col(g['name'], 36)}{RESET}{_col(g_lm_name, 34)}{g_status}")
 
         for c in ynab_cats_by_group.get(gid, []):
-            cid = c["id"]
+            cid   = c["id"]
             lm_cid = cats_map.get(cid)
             total_cats += 1
             if lm_cid is None:
-                c_status = YELLOW + "to create" + RESET
-                c_lm = RED + "null" + RESET
+                c_lm_name = RED + "(to create)" + RESET
+                c_status  = YELLOW + "to create" + RESET
             else:
-                c_status = GREEN + "matched" + RESET
-                c_lm = str(lm_cid)
+                cc = cache_cats.get(lm_cid, {})
+                c_lm_name = GREEN + (cc.get("name") or str(lm_cid)) + RESET
+                c_status  = GREEN + "matched" + RESET
                 matched_cats += 1
-            print(f"    {_col(c['name'], 38)}{_col(c_lm, 9)}{c_status}")
+            print(f"    {_col(c['name'], 34)}{_col(c_lm_name, 34)}{c_status}")
 
-    if excl.get("categories"):
-        print(f"\n  {BOLD}LM categories with no YNAB counterpart (excluded){RESET}")
-        for lid in excl["categories"]:
-            print(f"  {DIM}  [excluded]  id={lid}{RESET}")
+    # unmapped LM categories
+    referenced_cats = {v for v in cats_map.values() if v} | {v for v in groups_map.values() if v}
+    excluded_cats   = set(excl.get("categories", []))
+    unmapped_cats   = [c for c in cache.get("categories", [])
+                       if c["id"] not in referenced_cats and c["id"] not in excluded_cats]
+
+    if unmapped_cats:
+        print(f"\n  {BOLD}{RED}Unmapped LM categories — run fix-mapping{RESET}")
+        for c in unmapped_cats:
+            kind = "group" if c.get("is_group") else "cat  "
+            print(f"  {RED}⚠ [{kind}] {c['id']:8}  {c.get('name','?')}{RESET}")
 
     # ── summary ───────────────────────────────────────────────────────────────
-    acc_entries = raw.get("accounts", {})
-    matched_acc = sum(1 for v in acc_entries.values()
-                      if isinstance(v, dict) and v.get("lm_id") is not None)
-    needs_acc   = sum(1 for v in acc_entries.values()
-                      if isinstance(v, dict) and v.get("lm_id") is None
-                      and v.get("lm_type") != "excluded")
-
     print(f"\n{BOLD}Summary{RESET}")
     print(f"  Accounts:        {GREEN}{matched_acc} matched{RESET}"
           + (f", {RED}{needs_acc} need mapping{RESET}" if needs_acc else ""))
+    unmapped_lm_acc = len(unmapped_manual) + len(unmapped_plaid)
+    if unmapped_lm_acc:
+        print(f"  Unmapped LM:     {RED}{unmapped_lm_acc} account(s) not yet matched{RESET}")
     print(f"  Category groups: {GREEN}{matched_groups}/{total_groups} matched{RESET}"
           + (f", {YELLOW}{total_groups - matched_groups} to create{RESET}"
              if total_groups > matched_groups else ""))
     print(f"  Categories:      {GREEN}{matched_cats}/{total_cats} matched{RESET}"
           + (f", {YELLOW}{total_cats - matched_cats} to create{RESET}"
              if total_cats > matched_cats else ""))
+    if unmapped_cats:
+        print(f"  Unmapped LM:     {RED}{len(unmapped_cats)} category/group(s) not yet matched{RESET}")
     print()
+
+
+# ── fix-mapping ───────────────────────────────────────────────────────────────
+
+def _prompt(prompt: str) -> str:
+    """Read one line from stdin; raise KeyboardInterrupt on EOF."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        raise KeyboardInterrupt
+
+
+def _lm_acc_desc(a: dict, kind: str) -> str:
+    if kind == "plaid":
+        name = a.get("display_name") or a.get("name", "?")
+        mask = f"  mask={a['mask']}" if "mask" in a else ""
+        return f"{name}{mask}  ({a.get('type','?')}/{a.get('subtype','?')})"
+    bal = a.get("balance", "?")
+    return f"{a['name']}  ({a.get('type','?')}  bal={bal})"
+
+
+def cmd_fix_mapping(data_dir: Path, client: LMClient):
+    """Interactively map unmatched LM entities to YNAB entities."""
+    mapping_path = data_dir / MAPPING_FILE
+
+    print("Fetching Lunch Money state...")
+    lm_manual = client.get_manual_accounts()
+    lm_plaid   = client.get_plaid_accounts()
+    lm_cats_raw = client.get_categories()
+
+    lm_cats_flat: list[dict] = []
+    for c in lm_cats_raw:
+        lm_cats_flat.append(c)
+        lm_cats_flat.extend(c.get("children", []))
+
+    save_lm_cache(data_dir, lm_manual, lm_plaid, lm_cats_flat)
+
+    ynab_accounts: list[dict] = load_json(data_dir, "accounts")
+    ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
+
+    ynab_acc_by_id = {a["id"]: a for a in ynab_accounts}
+    ynab_groups = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
+    ynab_cats_flat: list[dict] = []
+    for g in ynab_groups:
+        for c in g.get("categories", []):
+            if not c["deleted"] and not c["internal"]:
+                ynab_cats_flat.append(c)
+    ynab_cat_by_id = {c["id"]: c for c in ynab_cats_flat}
+    ynab_group_by_id = {g["id"]: g for g in ynab_groups}
+
+    text = mapping_path.read_text()
+    raw  = yaml.safe_load(text)
+
+    accounts_section = raw.get("accounts", {})
+    groups_section   = raw.get("category_groups", {})
+    cats_section     = raw.get("categories", {})
+    excl             = raw.get("lm_excluded", {})
+
+    # IDs already referenced in the mapping
+    mapped_manual_ids = {
+        info["lm_id"] for info in accounts_section.values()
+        if isinstance(info, dict) and info.get("lm_type") == "manual" and info.get("lm_id")
+    }
+    mapped_plaid_ids = {
+        info["lm_id"] for info in accounts_section.values()
+        if isinstance(info, dict) and info.get("lm_type") == "plaid" and info.get("lm_id")
+    }
+    excluded_manual_ids = set(excl.get("manual_accounts", []))
+    excluded_plaid_ids  = set(excl.get("plaid_accounts",  []))
+    excluded_cat_ids    = set(excl.get("categories",      []))
+    mapped_cat_ids      = {v for v in cats_section.values() if v} | {v for v in groups_section.values() if v}
+
+    # YNAB candidates: those with lm_id still null (available to be claimed)
+    def ynab_acc_candidates(_lm_type: str) -> list[tuple[str, dict]]:
+        return [
+            (yid, ynab_acc_by_id[yid])
+            for yid, info in accounts_section.items()
+            if isinstance(info, dict)
+            and info.get("lm_id") is None
+            and info.get("lm_type") != "excluded"
+            and yid in ynab_acc_by_id
+        ]
+
+    def ynab_cat_candidates(is_group: bool) -> list[tuple[str, dict]]:
+        if is_group:
+            return [(yid, ynab_group_by_id[yid]) for yid, v in groups_section.items()
+                    if v is None and yid in ynab_group_by_id]
+        return [(yid, ynab_cat_by_id[yid]) for yid, v in cats_section.items()
+                if v is None and yid in ynab_cat_by_id]
+
+    changed = False
+
+    def save():
+        nonlocal text
+        mapping_path.write_text(text)
+        print(f"  → Saved {mapping_path}")
+
+    def do_account_section(lm_items: list[dict], lm_type: str, section_name: str,
+                            covered_ids: set, excluded_ids: set):
+        nonlocal text, changed
+        unresolved = [
+            a for a in lm_items
+            if a["id"] not in covered_ids and a["id"] not in excluded_ids
+        ] + [
+            a for a in lm_items
+            if a["id"] in excluded_ids
+        ]
+        if not unresolved:
+            print(f"  (all {section_name} already mapped)")
+            return
+
+        # sort: truly missing first, then excluded
+        unresolved.sort(key=lambda a: a["id"] not in excluded_ids)
+
+        for idx, lm_acc in enumerate(unresolved):
+            lid = lm_acc["id"]
+            desc = _lm_acc_desc(lm_acc, lm_type)
+            print(f"\n  LM {lm_type} [{lid}]  {BOLD}{desc}{RESET}")
+
+            cands = ynab_acc_candidates(lm_type)
+            if cands:
+                print(f"  YNAB candidates (currently unmatched):")
+                for i, (yid, ya) in enumerate(cands, 1):
+                    flags = []
+                    if ya.get("closed"): flags.append("closed")
+                    if ya.get("direct_import_linked"): flags.append("sync")
+                    flag_s = f" ({','.join(flags)})" if flags else ""
+                    bal = ya.get("balance_formatted", "")
+                    print(f"    {i:2}.  {ya['name']}{flag_s}  [{ya['type']}]  {bal}")
+            else:
+                print(f"  (no unmatched YNAB {lm_type} accounts — delete this LM account or add a YNAB entry first)")
+
+            print(f"  s=skip for now  q=quit+save")
+            while True:
+                try:
+                    choice = _prompt("  > ")
+                except KeyboardInterrupt:
+                    save()
+                    return
+
+                if choice == "q":
+                    save()
+                    return
+                elif choice == "s":
+                    print(f"  → Skipped")
+                    break
+                elif choice.isdigit():
+                    n = int(choice) - 1
+                    if cands and 0 <= n < len(cands):
+                        ynab_id, ya = cands[n]
+                        text = patch_yaml_account(text, ynab_id, lm_type, lid, "manual")
+                        if lid in excluded_ids:
+                            text = remove_from_lm_excluded(text, lid)
+                            excluded_ids.discard(lid)
+                        covered_ids.add(lid)
+                        changed = True
+                        print(f"  → Mapped YNAB '{ya['name']}' → LM {lid}")
+                        break
+                    else:
+                        print(f"  Invalid — enter 1–{len(cands)} or s/q")
+                else:
+                    print(f"  Invalid — enter a number or s/q")
+
+    def do_category_section(lm_items: list[dict], is_group: bool):
+        nonlocal text, changed
+        kind = "group" if is_group else "category"
+        unresolved = [
+            c for c in lm_items
+            if c["id"] not in mapped_cat_ids and c["id"] not in excluded_cat_ids
+        ] + [
+            c for c in lm_items
+            if c["id"] in excluded_cat_ids
+        ]
+        if not unresolved:
+            print(f"  (all LM {kind}s already mapped)")
+            return
+
+        for lm_cat in unresolved:
+            lid = lm_cat["id"]
+            name = lm_cat.get("name", "?")
+            print(f"\n  LM {kind} [{lid}]  {BOLD}{name}{RESET}")
+
+            cands = ynab_cat_candidates(is_group)
+            if cands:
+                print(f"  YNAB {kind} candidates (currently unmatched):")
+                for i, (yid, yc) in enumerate(cands, 1):
+                    print(f"    {i:2}.  {yc['name']}")
+            else:
+                print(f"  (no unmatched YNAB {kind}s — delete this LM {kind} or add a YNAB entry first)")
+
+            print(f"  s=skip for now  q=quit+save")
+            while True:
+                try:
+                    choice = _prompt("  > ")
+                except KeyboardInterrupt:
+                    save()
+                    return
+
+                if choice == "q":
+                    save()
+                    return
+                elif choice == "s":
+                    print(f"  → Skipped")
+                    break
+                elif choice.isdigit():
+                    n = int(choice) - 1
+                    if cands and 0 <= n < len(cands):
+                        ynab_id, yc = cands[n]
+                        if is_group:
+                            text = patch_yaml_scalar(text, ynab_id, lid)
+                            groups_section[ynab_id] = lid
+                        else:
+                            text = patch_yaml_scalar(text, ynab_id, lid)
+                            cats_section[ynab_id] = lid
+                        if lid in excluded_cat_ids:
+                            text = remove_from_lm_excluded(text, lid)
+                            excluded_cat_ids.discard(lid)
+                        mapped_cat_ids.add(lid)
+                        changed = True
+                        print(f"  → Mapped YNAB '{yc['name']}' → LM {lid}")
+                        break
+                    else:
+                        print(f"  Invalid — enter 1–{len(cands)} or s/q")
+                else:
+                    print(f"  Invalid — enter a number or s/q")
+
+    try:
+        print(f"\n{BOLD}─── Manual Accounts ───{RESET}")
+        do_account_section(lm_manual, "manual", "manual accounts",
+                           mapped_manual_ids, excluded_manual_ids)
+
+        print(f"\n{BOLD}─── Plaid Accounts ────{RESET}")
+        do_account_section(lm_plaid, "plaid", "plaid accounts",
+                           mapped_plaid_ids, excluded_plaid_ids)
+
+        lm_groups = [c for c in lm_cats_flat if c.get("is_group")]
+        lm_cats   = [c for c in lm_cats_flat if not c.get("is_group")]
+
+        print(f"\n{BOLD}─── Category Groups ───{RESET}")
+        do_category_section(lm_groups, is_group=True)
+
+        print(f"\n{BOLD}─── Categories ────────{RESET}")
+        do_category_section(lm_cats, is_group=False)
+
+    except KeyboardInterrupt:
+        pass
+
+    if changed:
+        save()
+    else:
+        print("\nNo changes made.")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -665,9 +1064,10 @@ def main():
                         help="Path to YNAB export directory (e.g. data/brl)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init-mapping", help="Generate initial mapping.yaml from YNAB export + LM state")
-    sub.add_parser("show-mapping", help="Display current mapping as a table (no API calls)")
-    sub.add_parser("audit", help="Verify every LM entity maps to a YNAB entity")
+    sub.add_parser("init-mapping",  help="Generate initial mapping.yaml from YNAB export + LM state")
+    sub.add_parser("show-mapping",  help="Display current mapping as a table (no API calls)")
+    sub.add_parser("fix-mapping",   help="Interactively map unmatched LM entities to YNAB entities")
+    sub.add_parser("audit",         help="Verify every LM entity maps to a YNAB entity")
     p_import = sub.add_parser("import", help="Import YNAB data into LM (dry-run by default)")
     p_import.add_argument("--apply", action="store_true", help="Apply changes (default: dry-run)")
 
@@ -680,6 +1080,11 @@ def main():
     # show-mapping reads only local files — no token needed
     if args.cmd == "show-mapping":
         cmd_show_mapping(data_dir)
+        return
+
+    if args.cmd == "fix-mapping":
+        token = get_env("LUNCHMONEY_API_TOKEN")
+        cmd_fix_mapping(data_dir, LMClient(token))
         return
 
     token = get_env("LUNCHMONEY_API_TOKEN")
