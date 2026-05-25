@@ -115,11 +115,19 @@ Base URL: `https://api.lunchmoney.dev/v2`
 ### Manual Accounts (formerly Assets)
 - Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `external_id`, `custom_metadata`, `exclude_from_transactions`
 - `external_id`: use to store YNAB account UUID for deduplication on re-import
+- `custom_metadata`: freeform JSON; use to store additional YNAB account info (e.g. `{"ynab_name": "...", "ynab_type": "..."}`) that may be useful for debugging or re-runs
 
 ### Plaid Accounts
 - Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `allow_transaction_modification`
-- **Read-only**: do not attempt to import transactions into Plaid-linked accounts
-- `allow_transaction_modification: false` means the account is bank-synced
+- `allow_transaction_modification`: when `false`, the account is fully bank-synced and LM blocks manual transaction changes — do not import transactions into these accounts. When `true`, LM permits manual transaction additions even though the account has a Plaid connection (e.g. connection lost but not yet converted back to manual) — importing into these is allowed.
+- **No `external_id` or `custom_metadata`** — Plaid accounts have no writable metadata fields; YNAB↔Plaid mapping must be stored locally in the mapping file
+
+#### Merging manual accounts with Plaid accounts
+Lunch Money supports merging a manually-managed account with a synced (Plaid) account via the UI, but:
+- **The merge is irreversible** — once merged it cannot be undone
+- It is a manual step the user must perform in the web UI; there is no API for it
+
+**Recommended strategy**: require the user to set up Plaid bank sync in Lunch Money *before* running the importer for any accounts that are `direct_import_linked: true` in YNAB. The importer then skips creating a manual account for those and instead matches transactions to the existing Plaid account. This avoids the merge step entirely.
 
 ### Transactions
 - Fields: `id`, `amount`, `currency`, `payee`, `category_id`, `manual_account_id`, `tag_ids`, `is_split_parent`, `split_parent_id`, `created_at`, `updated_at`
@@ -134,11 +142,16 @@ Base URL: `https://api.lunchmoney.dev/v2`
 ## Migration Plan
 
 ### Phase 0: Accounts (v0.1)
+
+**Prerequisite**: if any YNAB accounts have `direct_import_linked: true`, the user must have already set up Plaid bank sync for those accounts in Lunch Money before running the importer. The importer will warn and require confirmation if it cannot find a Plaid account match for a `direct_import_linked` YNAB account.
+
 1. Export all YNAB accounts
 2. Match against existing Lunch Money manual accounts (by name, or by `external_id` if re-running)
-3. For YNAB accounts with `direct_import_linked: true`, try to match to Lunch Money Plaid accounts — these should NOT be re-created as manual accounts; transactions into them should be skipped
-4. Create missing manual accounts in Lunch Money, storing YNAB UUID in `external_id`
-5. **Balance check**: after all transactions are imported, compare computed balance against YNAB's `cleared_balance` and `uncleared_balance`
+3. For YNAB accounts with `direct_import_linked: true`, match to Lunch Money Plaid accounts by name (case-insensitive) — these must NOT be re-created as manual accounts; transactions into them should target the matched Plaid account if `allow_transaction_modification: true`, or be skipped if `allow_transaction_modification: false`
+   - If no Plaid match is found: warn the user and skip the account (do not create a manual account). The user must resolve this manually — either by connecting Plaid sync in LM or by explicitly opting in to creating a manual account for it
+4. For closed YNAB accounts (`closed: true`): create as manual accounts in Lunch Money (so their transaction history is preserved), but note they are closed in `custom_metadata`
+5. Create missing manual accounts in Lunch Money, storing YNAB UUID in `external_id`
+6. **Balance check**: after all transactions are imported, compare computed balance against YNAB's `cleared_balance` and `uncleared_balance`
 
 ### Phase 0: Categories (v0.2)
 1. Export YNAB category groups and categories
@@ -208,7 +221,7 @@ After importing transactions:
 1. Always check if a Lunch Money account with matching `external_id` already exists before creating
 2. Always check transaction `custom_metadata.ynab_id` before inserting (for re-runs)
 3. Respect the `skipped_duplicates` response from Lunch Money POST /transactions
-4. Never import into Plaid-linked Lunch Money accounts (`allow_transaction_modification: false`)
+4. Never import into Plaid-linked Lunch Money accounts where `allow_transaction_modification: false`
 5. Never import YNAB accounts that have been matched to existing Plaid accounts
 
 ## Date-Range Filtering
