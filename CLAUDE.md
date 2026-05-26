@@ -293,6 +293,15 @@ This tool automates that:
 - **On apply**: set category to "Payment, Transfer" on both legs if not already set, then create an LM transaction group linking the two.
 - **Do not use "create transfer"** on already-imported transactions — that generates a spurious third entry.
 
+## Multi-Budget Notes
+
+### BRL accounts in the CAD budget
+The CAD YNAB budget contains BRL accounts that were only used to represent BRL balances — they are not real CAD accounts. There is a separate BRL YNAB budget that will eventually be imported into Lunch Money independently.
+
+**Plan**: when importing the CAD budget, these BRL accounts (and their transactions) should be excluded. The importer will need a per-account exclude/ignore mechanism — likely a flag or config that lets the user mark specific YNAB account IDs or names as excluded from a given import run.
+
+This is low priority but the account-exclude feature should be kept in mind when designing the account import phase.
+
 ## Implementation Notes
 
 - Importer must always print a **dry-run summary** (counts of creates/skips/conflicts per resource type) and prompt for confirmation before writing anything
