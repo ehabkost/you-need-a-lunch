@@ -22,6 +22,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping
+from sync_state import SyncState
 
 LM_CACHE_FILE = "lm_cache.json"
 
@@ -819,6 +820,219 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
         print("\nNo changes made.")
 
 
+# ── import: accounts phase ────────────────────────────────────────────────────
+
+# Actions for the account plan
+_A_CREATE        = "create"         # create a new LM manual account
+_A_SYNCED        = "already_synced" # already recorded in sync_state, nothing to do
+_A_RECOVER       = "recover"        # found in LM by external_id, record in sync_state
+_A_PLAID         = "match_plaid"    # matched to an existing LM Plaid account
+_A_PLAID_RO      = "skip_plaid_ro"  # Plaid match found but read-only — skip
+_A_DELETED       = "skip_deleted"   # YNAB account is deleted
+
+
+def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
+                         lm_manual: list, lm_plaid: list) -> list:
+    currency = meta["currency"].lower()
+
+    lm_manual_by_ext = {a["external_id"]: a for a in lm_manual if a.get("external_id")}
+    lm_plaid_by_norm = {normalize(a.get("display_name") or a.get("name", "")): a
+                        for a in lm_plaid}
+
+    plan = []
+    for acc in sorted(ynab_accounts, key=lambda a: (not a["on_budget"], a["name"])):
+        ynab_id = acc["id"]
+
+        if acc["deleted"]:
+            plan.append({"action": _A_DELETED, "acc": acc})
+            continue
+
+        existing = sync.account(ynab_id)
+        if existing:
+            plan.append({"action": _A_SYNCED, "acc": acc,
+                         "lm_id": existing["lm_id"], "lm_type": existing["lm_type"],
+                         "lm_name": existing["lm_name"]})
+            continue
+
+        # Crash recovery: already created in LM but not yet in sync_state
+        if ynab_id in lm_manual_by_ext:
+            lm_acc = lm_manual_by_ext[ynab_id]
+            plan.append({"action": _A_RECOVER, "acc": acc, "lm_type": "manual",
+                         "lm_id": lm_acc["id"], "lm_name": lm_acc["name"]})
+            continue
+
+        # Bank-synced in YNAB: try to match an existing Plaid account in LM
+        if acc.get("direct_import_linked"):
+            match = lm_plaid_by_norm.get(normalize(acc["name"]))
+            if match:
+                if match.get("allow_transaction_modification", True):
+                    plan.append({"action": _A_PLAID, "acc": acc,
+                                 "lm_id": match["id"],
+                                 "lm_name": match.get("display_name") or match.get("name")})
+                else:
+                    plan.append({"action": _A_PLAID_RO, "acc": acc,
+                                 "lm_id": match["id"],
+                                 "lm_name": match.get("display_name") or match.get("name")})
+                continue
+
+        # Create as manual account
+        lm_type = YNAB_TO_LM_TYPE.get(acc.get("type", ""), "other asset")
+        custom = {"ynab_type": acc.get("type"), "ynab_on_budget": acc.get("on_budget")}
+        if acc.get("direct_import_linked"):
+            custom["ynab_bank_synced"] = True  # was direct-import in YNAB, no Plaid match
+        if acc.get("note"):
+            custom["ynab_note"] = acc["note"]
+
+        payload: dict = {
+            "name": acc["name"][:45],
+            "type": lm_type,
+            "balance": "0.0000",
+            "currency": currency,
+            "external_id": ynab_id,
+            "custom_metadata": custom,
+        }
+        if acc.get("closed"):
+            payload["status"] = "closed"
+
+        plan.append({"action": _A_CREATE, "acc": acc, "lm_type": "manual",
+                     "lm_payload": payload})
+
+    return plan
+
+
+def _print_account_plan(plan: list, apply: bool):
+    counts = {k: 0 for k in (_A_CREATE, _A_SYNCED, _A_RECOVER, _A_PLAID,
+                               _A_PLAID_RO, _A_DELETED)}
+    for item in plan:
+        counts[item["action"]] += 1
+
+    verb = "Will" if apply else "Would"
+    print(f"\n  {verb} create  {counts[_A_CREATE]:3} manual account(s)")
+    if counts[_A_RECOVER]:
+        print(f"  {verb} recover {counts[_A_RECOVER]:3} already-created account(s) into sync state")
+    if counts[_A_PLAID]:
+        print(f"  {verb} link    {counts[_A_PLAID]:3} account(s) to existing Plaid accounts")
+    if counts[_A_PLAID_RO]:
+        print(f"  {YELLOW}Skip     {counts[_A_PLAID_RO]:3} Plaid account(s) (read-only){RESET}")
+    if counts[_A_SYNCED]:
+        print(f"  Skip     {counts[_A_SYNCED]:3} already-synced account(s)")
+    if counts[_A_DELETED]:
+        print(f"  Skip     {counts[_A_DELETED]:3} deleted account(s)")
+
+    if counts[_A_CREATE] == 0 and counts[_A_RECOVER] == 0 and counts[_A_PLAID] == 0:
+        return
+
+    on_budget  = [i for i in plan if i["action"] == _A_CREATE and i["acc"].get("on_budget")]
+    off_budget = [i for i in plan if i["action"] == _A_CREATE and not i["acc"].get("on_budget")]
+
+    def _print_group(label: str, items: list):
+        if not items:
+            return
+        print(f"\n    {CYAN}{label}{RESET}")
+        for item in items:
+            acc = item["acc"]
+            flags = []
+            if acc.get("closed"):               flags.append("closed")
+            if acc.get("direct_import_linked"): flags.append("was-synced")
+            flag_s = f"  ({', '.join(flags)})" if flags else ""
+            lm_type = YNAB_TO_LM_TYPE.get(acc.get("type", ""), "other asset")
+            print(f"      {acc['name']}{flag_s}  [{acc.get('type')} → {lm_type}]")
+
+    if on_budget or off_budget:
+        print()
+    _print_group("On budget",  on_budget)
+    _print_group("Off budget", off_budget)
+
+    if counts[_A_PLAID]:
+        plaid_items = [i for i in plan if i["action"] == _A_PLAID]
+        print(f"\n    {CYAN}Matched to Plaid{RESET}")
+        for item in plaid_items:
+            print(f"      {item['acc']['name']}  → LM Plaid '{item['lm_name']}'")
+
+    if counts[_A_PLAID_RO]:
+        print(f"\n    {YELLOW}Skipped (Plaid read-only — transactions cannot be added){RESET}")
+        for item in (i for i in plan if i["action"] == _A_PLAID_RO):
+            print(f"      {item['acc']['name']}  → LM Plaid '{item['lm_name']}'")
+
+
+def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState,
+                   meta: dict, apply: bool) -> int:
+    """Plan and optionally execute account sync. Returns count of changes made."""
+    ynab_accounts: list = load_json(data_dir, "accounts")
+
+    print("  Fetching Lunch Money accounts...")
+    lm_manual = client.get_manual_accounts()
+    lm_plaid  = client.get_plaid_accounts()
+
+    plan = _build_account_plan(ynab_accounts, meta, sync, lm_manual, lm_plaid)
+    _print_account_plan(plan, apply)
+
+    actionable = [i for i in plan if i["action"] in (_A_CREATE, _A_RECOVER, _A_PLAID)]
+    if not actionable:
+        print(f"\n  {GREEN}Nothing to do.{RESET}")
+        return 0
+
+    if not apply:
+        print(f"\n  {DIM}(dry-run — pass --apply to create){RESET}")
+        return 0
+
+    print()
+    changes = 0
+    for item in plan:
+        action = item["action"]
+        acc    = item["acc"]
+
+        if action == _A_CREATE:
+            result = client.create_manual_account(item["lm_payload"])
+            sync.set_account(acc["id"], lm_type="manual",
+                             lm_id=result["id"], lm_name=result["name"])
+            sync.save(data_dir)
+            print(f"  {GREEN}✓{RESET} Created  '{acc['name']}'  → LM manual {result['id']}")
+            changes += 1
+
+        elif action == _A_RECOVER:
+            sync.set_account(acc["id"], lm_type="manual",
+                             lm_id=item["lm_id"], lm_name=item["lm_name"])
+            sync.save(data_dir)
+            print(f"  {GREEN}✓{RESET} Recovered '{acc['name']}'  → LM manual {item['lm_id']}")
+            changes += 1
+
+        elif action == _A_PLAID:
+            sync.set_account(acc["id"], lm_type="plaid",
+                             lm_id=item["lm_id"], lm_name=item["lm_name"])
+            sync.save(data_dir)
+            print(f"  {GREEN}✓{RESET} Linked   '{acc['name']}'  → LM Plaid {item['lm_id']}")
+            changes += 1
+
+    return changes
+
+
+# ── import command ────────────────────────────────────────────────────────────
+
+def cmd_import(data_dir: Path, client: LMClient, apply: bool):
+    meta: dict = load_json(data_dir, "export_metadata")
+    sync = SyncState.load_or_create(
+        data_dir,
+        ynab_budget_id=meta["budget_id"],
+        ynab_budget_name=meta["budget_name"],
+        currency=meta["currency"].lower(),
+    )
+
+    label = f"{meta['budget_name']} ({meta['currency']})"
+    mode  = "APPLYING" if apply else "DRY-RUN"
+    print(BOLD + f"\nImporting {label}  [{mode}]\n" + RESET)
+
+    print(BOLD + "── Accounts ──" + RESET)
+    phase_accounts(data_dir, client, sync, meta, apply)
+
+    # Future phases (categories, transactions) go here
+
+    if not apply:
+        print(f"\n{DIM}Run with --apply to execute the above changes.{RESET}\n")
+    else:
+        print(f"\n{GREEN}Done.{RESET}  Sync state: {data_dir / 'sync_state.json'}\n")
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -857,8 +1071,7 @@ def main():
         cmd_audit(data_dir, client)
 
     elif args.cmd == "import":
-        print("Import not yet implemented.", file=sys.stderr)
-        sys.exit(1)
+        cmd_import(data_dir, client, apply=args.apply)
 
 
 if __name__ == "__main__":
