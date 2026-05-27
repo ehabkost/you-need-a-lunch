@@ -902,8 +902,8 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
         }
         if lm_subtype:
             payload["subtype"] = lm_subtype
-        if acc.get("closed"):
-            payload["closed_on"] = acc.get("closed")  # Store closure date if available
+        # Note: YNAB doesn't track closure dates, only a boolean flag
+        # Users can set closed_on manually in LM if needed
 
         plan.append({"action": _A_CREATE, "acc": acc, "lm_type": "manual",
                      "lm_payload": payload})
