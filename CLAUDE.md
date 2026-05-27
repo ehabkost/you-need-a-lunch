@@ -107,4 +107,4 @@ See **[docs/multi-budget.md](docs/multi-budget.md)** for:
   - "Inflow: Ready to Assign" → map to Income category in LM
   - Other internal categories → if found in data, ask user how to handle (warn and require confirmation)
 - Local sync state is stored in `data/<slug>/<lm_account_id>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions, keyed by LM account ID. This allows the same YNAB budget to be imported to multiple LM accounts. Machine-generated; do not edit manually.
-- LM metadata storage: accounts use `external_id` (YNAB UUID) and `custom_metadata` (YNAB type/flags); categories and transactions use `custom_metadata` only (no `external_id` field available)
+- LM metadata storage: accounts use `external_id` (format: `ynab:{budget_id}:{account_id}`) and `custom_metadata` (YNAB type/flags); categories and transactions use `custom_metadata` only (no `external_id` field available)

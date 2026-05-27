@@ -18,7 +18,7 @@ The migration is structured in phases, with each phase building on previous work
    - `closed_on`: account closure date (or import date if unknown)
    - `exclude_from_transactions: true`: prevent accidental future activity
    - Store `{"ynab_closed": true}` in `custom_metadata` for reference
-5. Create missing manual accounts in Lunch Money, storing YNAB UUID in `external_id`
+5. Create missing manual accounts in Lunch Money, storing fully qualified YNAB identifier in `external_id`: format `ynab:{budget_id}:{account_id}`
 6. **Balance check**: after all transactions are imported, compare computed balance against YNAB's `cleared_balance` and `uncleared_balance`
 
 ## Phase 0: Categories (v0.2)
