@@ -1510,11 +1510,11 @@ class ManualAccountObject(BaseModel):
         ),
     ]
     display_name: Annotated[
-        str,
+        str | None,
         Field(
             description='Optional display name for the account as set by the user or derived from the `institution_name` and `name` if not explicitly set.'
         ),
-    ]
+    ] = None
     type: Annotated[AccountTypeEnum, Field(description='Primary type of the account')]
     subtype: Annotated[
         str,
@@ -1550,19 +1550,19 @@ class ManualAccountObject(BaseModel):
     ]
     status: Annotated[Status, Field(description='The status of the account')]
     closed_on: Annotated[
-        date_aliased,
+        date_aliased | None,
         Field(
             description='The date this account was closed in YYYY-MM-DD format. Will be null if the account has not been marked as closed.'
         ),
-    ]
+    ] = None
     external_id: Annotated[
-        str,
+        str | None,
         Field(
             description='An optional external_id that may be set or updated via the API',
             max_length=75,
             min_length=0,
         ),
-    ]
+    ] = None
     custom_metadata: Annotated[
         dict[str, Any] | None,
         Field(
