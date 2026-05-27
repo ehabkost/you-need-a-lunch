@@ -50,10 +50,40 @@ Based on actual API responses and testing:
 - **Cause**: Using "checking", "savings" as account types (YNAB types, not LM types)
 - **Fix**: Use `type: "cash"` with `subtype: "checking"` or `subtype: "savings"`
 
-## Testing Against Spec
+## OpenAPI Spec Validation
 
-User-provided OpenAPI spec references:
-- `blob:https://alpha.lunchmoney.dev/a9804836-2369-4b86-975d-e558e55e9dc1`
-- `blob:https://alpha.lunchmoney.dev/29279db6-3a0e-46b1-9a34-254815b5380b`
+**Spec Location**: `docs/lunchmoney-api-v2.json` (v2.9.4)
 
-These should be checked against the actual implementation for complete validation.
+All API endpoints used by the importer have been validated against the OpenAPI spec:
+- ✓ GET /manual_accounts
+- ✓ GET /plaid_accounts  
+- ✓ GET /categories
+- ✓ GET /transactions
+- ✓ POST /manual_accounts
+- ✓ PUT /manual_accounts/{id}
+- ✓ POST /categories
+- ✓ PUT /categories/{id}
+- ✓ POST /transactions
+- ✓ PUT /budgets
+
+### Running Validation
+
+```bash
+.venv/bin/python3 importer/validate_api_calls.py
+```
+
+### Request Validation Results
+
+**POST /manual_accounts**: ✓ Valid
+- All required fields present: `name`, `type`, `balance`
+- All optional fields correctly typed
+
+**POST /transactions**: ✓ Valid
+- Request schema with transaction array validated
+- Supports `apply_rules`, `skip_duplicates`, `skip_balance_update` options
+
+### Response Validation
+
+The GET responses include server-side fields that are present in real API responses but not always needed in test data:
+- Manual accounts: `display_name`, `status`, `created_at`, `updated_at`, etc. (read-only)
+- Transactions: `id`, `status`, `created_at`, `updated_at`, `source`, etc. (read-only)

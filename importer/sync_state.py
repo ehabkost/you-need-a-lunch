@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+from pydantic import BaseModel, ConfigDict, Field
+
 SYNC_STATE_FILE = "sync_state.json"
 SCHEMA_VERSION = 1
 
@@ -43,8 +45,44 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class AccountEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lm_type: str                       # manual | plaid | skipped
+    lm_id: Optional[int] = None        # null only for lm_type=skipped
+    lm_name: str = ""
+    synced_at: str = ""
+
+
+class CategoryGroupEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lm_id: int
+    lm_name: str = ""
+    synced_at: str = ""
+
+
+class CategoryEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lm_id: int
+    lm_name: str = ""
+    lm_group_id: Optional[int] = None
+    synced_at: str = ""
+
+
+class SyncStateData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    schema_version: int = SCHEMA_VERSION
+    ynab_budget_id: str = ""
+    ynab_budget_name: str = ""
+    lm_account_id: int = 0
+    currency: str = ""
+    last_updated: str = ""
+    accounts: dict[str, AccountEntry] = Field(default_factory=dict)
+    category_groups: dict[str, CategoryGroupEntry] = Field(default_factory=dict)
+    categories: dict[str, CategoryEntry] = Field(default_factory=dict)
+
+
 class SyncState:
-    def __init__(self, data: dict):
+    def __init__(self, data: SyncStateData):
         self._d = data
 
     @classmethod
@@ -55,76 +93,64 @@ class SyncState:
         path = sync_dir / SYNC_STATE_FILE
 
         if path.exists():
-            data = json.loads(path.read_text())
+            data = SyncStateData(**json.loads(path.read_text()))
         else:
-            data = {
-                "schema_version": SCHEMA_VERSION,
-                "ynab_budget_id": ynab_budget_id,
-                "ynab_budget_name": ynab_budget_name,
-                "lm_account_id": lm_account_id,
-                "currency": currency,
-                "accounts": {},
-                "category_groups": {},
-                "categories": {},
-            }
+            data = SyncStateData(
+                ynab_budget_id=ynab_budget_id,
+                ynab_budget_name=ynab_budget_name,
+                lm_account_id=lm_account_id,
+                currency=currency,
+            )
         return cls(data), sync_dir
 
-    def save(self, sync_dir: Path):
-        self._d["last_updated"] = _now()
+    def save(self, sync_dir: Path) -> None:
+        self._d.last_updated = _now()
         (sync_dir / SYNC_STATE_FILE).write_text(
-            json.dumps(self._d, indent=2, ensure_ascii=False)
+            self._d.model_dump_json(indent=2)
         )
 
     # ── accounts ──────────────────────────────────────────────────────────────
 
-    def account(self, ynab_id: str) -> Optional[dict]:
-        return self._d["accounts"].get(ynab_id)
+    def account(self, ynab_id: str) -> Optional[AccountEntry]:
+        return self._d.accounts.get(ynab_id)
 
     def set_account(self, ynab_id: str, *, lm_type: str,
-                    lm_id: Optional[int], lm_name: str):
-        self._d["accounts"][ynab_id] = {
-            "lm_type": lm_type,
-            "lm_id": lm_id,
-            "lm_name": lm_name,
-            "synced_at": _now(),
-        }
+                    lm_id: Optional[int], lm_name: str) -> None:
+        self._d.accounts[ynab_id] = AccountEntry(
+            lm_type=lm_type, lm_id=lm_id, lm_name=lm_name, synced_at=_now(),
+        )
 
     # ── category groups ───────────────────────────────────────────────────────
 
-    def category_group(self, ynab_id: str) -> Optional[dict]:
-        return self._d["category_groups"].get(ynab_id)
+    def category_group(self, ynab_id: str) -> Optional[CategoryGroupEntry]:
+        return self._d.category_groups.get(ynab_id)
 
-    def set_category_group(self, ynab_id: str, *, lm_id: int, lm_name: str):
-        self._d["category_groups"][ynab_id] = {
-            "lm_id": lm_id,
-            "lm_name": lm_name,
-            "synced_at": _now(),
-        }
+    def set_category_group(self, ynab_id: str, *, lm_id: int, lm_name: str) -> None:
+        self._d.category_groups[ynab_id] = CategoryGroupEntry(
+            lm_id=lm_id, lm_name=lm_name, synced_at=_now(),
+        )
 
     # ── categories ────────────────────────────────────────────────────────────
 
-    def category(self, ynab_id: str) -> Optional[dict]:
-        return self._d["categories"].get(ynab_id)
+    def category(self, ynab_id: str) -> Optional[CategoryEntry]:
+        return self._d.categories.get(ynab_id)
 
     def set_category(self, ynab_id: str, *, lm_id: int, lm_name: str,
-                     lm_group_id: Optional[int] = None):
-        self._d["categories"][ynab_id] = {
-            "lm_id": lm_id,
-            "lm_name": lm_name,
-            "lm_group_id": lm_group_id,
-            "synced_at": _now(),
-        }
+                     lm_group_id: Optional[int] = None) -> None:
+        self._d.categories[ynab_id] = CategoryEntry(
+            lm_id=lm_id, lm_name=lm_name, lm_group_id=lm_group_id, synced_at=_now(),
+        )
 
     # ── lookups ───────────────────────────────────────────────────────────────
 
     def lm_account_id(self, ynab_id: str) -> Optional[int]:
         e = self.account(ynab_id)
-        return e["lm_id"] if e else None
+        return e.lm_id if e else None
 
     def lm_category_id(self, ynab_id: str) -> Optional[int]:
         e = self.category(ynab_id)
-        return e["lm_id"] if e else None
+        return e.lm_id if e else None
 
     def lm_category_group_id(self, ynab_id: str) -> Optional[int]:
         e = self.category_group(ynab_id)
-        return e["lm_id"] if e else None
+        return e.lm_id if e else None

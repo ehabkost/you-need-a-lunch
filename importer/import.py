@@ -14,15 +14,24 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Sequence
 
 import re
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
+from lm_api_types_generated import CategoryObject, ChildCategoryObject, ManualAccountObject, PlaidAccountObject
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping
 from sync_state import SyncState
+
+# Useful for some generic account handling functions:
+AnyCategory = CategoryObject | ChildCategoryObject
+AnyAccount = ManualAccountObject | PlaidAccountObject
+
+# just raw dicts for now:
+YnabAccount = dict
 
 LM_CACHE_FILE = "lm_cache.json"
 
@@ -50,14 +59,16 @@ def get_env(name: str) -> str:
     return v
 
 
-def load_json(data_dir: Path, name: str) -> list | dict:
+def load_json(data_dir: Path, name: str) -> Any:
+    """Load an export JSON file. Caller annotates the expected shape (list/dict)."""
     return json.loads((data_dir / f"{name}.json").read_text())
 
 
 def load_lm_cache(data_dir: Path) -> dict:
     path = data_dir / LM_CACHE_FILE
     if path.exists():
-        return json.loads(path.read_text())
+        data: dict = json.loads(path.read_text())
+        return data
     return {}
 
 
@@ -151,17 +162,17 @@ def name_similarity(a: str, b: str) -> float:
 
 # ── matching helpers ──────────────────────────────────────────────────────────
 
-def score_account_match(ynab_acc: dict, lm_acc: dict) -> tuple[float, str]:
+def score_account_match(ynab_acc: YnabAccount, lm_acc: AnyAccount) -> tuple[float, str]:
     """Return (score 0–1, reason) for how well lm_acc matches ynab_acc."""
     note_digits = re.sub(r"\D", "", (ynab_acc.get("note") or ""))
-    mask = lm_acc.get("mask", "")
+    mask = lm_acc.mask if isinstance(lm_acc, PlaidAccountObject) else ""
     if mask and mask in note_digits:
         return 1.0, f"mask ···{mask} in note"
-    lm_name = lm_acc.get("display_name") or lm_acc.get("name", "")
+    lm_name = lm_acc.display_name or lm_acc.name or ""
     ns = name_similarity(ynab_acc.get("name", ""), lm_name)
     ynab_type = ynab_acc.get("type", "")
     lm_type_equiv = {"creditCard": "credit"}.get(ynab_type, "depository")
-    type_ok = lm_acc.get("type", "") == lm_type_equiv
+    type_ok = lm_acc.type or "" == lm_type_equiv
     score = ns * 0.7 + (0.3 if type_ok else 0.0)
     return score, f"name similarity {ns:.0%}"
 
@@ -205,10 +216,10 @@ def cmd_audit(data_dir: Path, client: LMClient):
     lm_plaid  = client.get_plaid_accounts()
     lm_cats_raw = client.get_categories()
 
-    lm_cats_flat: list[dict] = []
+    lm_cats_flat: list[CategoryObject | ChildCategoryObject] = []
     for c in lm_cats_raw:
         lm_cats_flat.append(c)
-        lm_cats_flat.extend(c.get("children", []))
+        lm_cats_flat.extend(c.children or [])
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -217,8 +228,8 @@ def cmd_audit(data_dir: Path, client: LMClient):
     # ── manual accounts ───────────────────────────────────────────────────────
     print("Checking manual accounts...")
     for a in lm_manual:
-        lid = a["id"]
-        name = a["name"]
+        lid = a.id
+        name = a.name
 
         if mapping.is_excluded_manual(lid):
             ok.append(f"  [excluded]  manual account {lid} '{name}'")
@@ -228,7 +239,7 @@ def cmd_audit(data_dir: Path, client: LMClient):
 
         if not ynab_id:
             # check if external_id gives us a clue
-            ext = a.get("external_id")
+            ext = a.external_id
             if ext:
                 errors.append(
                     f"  ✗ manual account {lid} '{name}' has external_id={ext} "
@@ -243,7 +254,7 @@ def cmd_audit(data_dir: Path, client: LMClient):
             continue
 
         # verify external_id on the LM account matches the mapped YNAB account
-        ext = a.get("external_id")
+        ext = a.external_id
         if ext and ext != ynab_id:
             warnings.append(
                 f"  ⚠ manual account {lid} '{name}' external_id={ext} "
@@ -260,9 +271,9 @@ def cmd_audit(data_dir: Path, client: LMClient):
     # ── plaid accounts ────────────────────────────────────────────────────────
     print("Checking plaid accounts...")
     for a in lm_plaid:
-        lid = a["id"]
-        name = a.get("display_name") or a.get("name", "?")
-        mask = a.get("mask", "?")
+        lid = a.id
+        name = a.display_name or a.name
+        mask = a.mask
 
         if mapping.is_excluded_plaid(lid):
             ok.append(f"  [excluded]  plaid account {lid} '{name}' mask={mask}")
@@ -281,9 +292,9 @@ def cmd_audit(data_dir: Path, client: LMClient):
     # ── categories ────────────────────────────────────────────────────────────
     print("Checking categories...")
     for c in lm_cats_flat:
-        lid = c["id"]
-        name = c["name"]
-        is_group = c.get("is_group", False)
+        lid = c.id
+        name = c.name
+        is_group = c.is_group
 
         if mapping.is_excluded_category(lid):
             ok.append(f"  [excluded]  {'group' if is_group else 'category'} {lid} '{name}'")
@@ -314,7 +325,7 @@ def cmd_audit(data_dir: Path, client: LMClient):
     for lm_id in mapped_manual_ids:
         txns = client.get_transactions(manual_account_id=lm_id, start_date="2020-01-01",
                                        end_date=datetime.now().strftime("%Y-%m-%d"))
-        no_ext = [t for t in txns if not t.get("external_id")]
+        no_ext = [t for t in txns if not t.external_id]
         if no_ext:
             txn_errors += len(no_ext)
             errors.append(
@@ -553,13 +564,14 @@ def _prompt(prompt: str) -> str:
         raise KeyboardInterrupt
 
 
-def _lm_acc_desc(a: dict, kind: str) -> str:
+def _lm_acc_desc(a: AnyAccount, kind: str) -> str:
     if kind == "plaid":
-        name = a.get("display_name") or a.get("name", "?")
-        mask = f"  mask={a['mask']}" if "mask" in a else ""
-        return f"{name}{mask}  ({a.get('type','?')}/{a.get('subtype','?')})"
-    bal = a.get("balance", "?")
-    return f"{a['name']}  ({a.get('type','?')}  bal={bal})"
+        assert isinstance(a, PlaidAccountObject)
+        name = a.display_name or a.name or "?"
+        mask = f"  mask={a.mask}" if a.mask else ""
+        return f"{name}{mask}  ({a.type or '?'}:{a.subtype or '?'})"
+    bal = a.balance or "?"
+    return f"{a.name or '?'}  ({a.type or '?'}  bal={bal})"
 
 
 def cmd_fix_mapping(data_dir: Path, client: LMClient):
@@ -571,14 +583,14 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
     lm_plaid   = client.get_plaid_accounts()
     lm_cats_raw = client.get_categories()
 
-    lm_cats_flat: list[dict] = []
+    lm_cats_flat: list[AnyCategory] = []
     for c in lm_cats_raw:
         lm_cats_flat.append(c)
-        lm_cats_flat.extend(c.get("children", []))
+        lm_cats_flat.extend(c.children or [])
 
     save_lm_cache(data_dir, lm_manual, lm_plaid, lm_cats_flat)
 
-    ynab_accounts: list[dict] = load_json(data_dir, "accounts")
+    ynab_accounts: list[dict[str, dict]] = load_json(data_dir, "accounts")
     ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
     meta: dict = load_json(data_dir, "export_metadata")
 
@@ -651,25 +663,25 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
         mapping_path.write_text(text)
         print(f"  → Saved {mapping_path}")
 
-    def do_account_section(lm_items: list[dict], lm_type: str, section_name: str,
+    def do_account_section(lm_items: Sequence[AnyAccount], lm_type: str, section_name: str,
                             covered_ids: set, excluded_ids: set):
         nonlocal text, changed
         unresolved = [
             a for a in lm_items
-            if a["id"] not in covered_ids and a["id"] not in excluded_ids
+            if a.id not in covered_ids and a.id not in excluded_ids
         ] + [
             a for a in lm_items
-            if a["id"] in excluded_ids
+            if a.id in excluded_ids
         ]
         if not unresolved:
             print(f"  (all {section_name} already mapped)")
             return
 
         # sort: truly missing first, then excluded
-        unresolved.sort(key=lambda a: a["id"] not in excluded_ids)
+        unresolved.sort(key=lambda a: a.id not in excluded_ids)
 
         for idx, lm_acc in enumerate(unresolved):
-            lid = lm_acc["id"]
+            lid = lm_acc.id
             desc = _lm_acc_desc(lm_acc, lm_type)
             print(f"\n  LM {lm_type} [{lid}]  {BOLD}{desc}{RESET}")
 
@@ -726,23 +738,23 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
                 else:
                     print(f"  Invalid — enter a number or s/q")
 
-    def do_category_section(lm_items: list[dict], is_group: bool):
+    def do_category_section(lm_items: Sequence[AnyCategory], is_group: bool):
         nonlocal text, changed
         kind = "group" if is_group else "category"
         unresolved = [
             c for c in lm_items
-            if c["id"] not in mapped_cat_ids and c["id"] not in excluded_cat_ids
+            if c.id not in mapped_cat_ids and c.id not in excluded_cat_ids
         ] + [
             c for c in lm_items
-            if c["id"] in excluded_cat_ids
+            if c.id in excluded_cat_ids
         ]
         if not unresolved:
             print(f"  (all LM {kind}s already mapped)")
             return
 
         for lm_cat in unresolved:
-            lid = lm_cat["id"]
-            name = lm_cat.get("name", "?")
+            lid = lm_cat.id
+            name = lm_cat.name or "?"
             print(f"\n  LM {kind} [{lid}]  {BOLD}{name}{RESET}")
 
             cands_raw = ynab_cat_candidates(is_group)
@@ -805,8 +817,8 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
         do_account_section(lm_plaid, "plaid", "plaid accounts",
                            mapped_plaid_ids, excluded_plaid_ids)
 
-        lm_groups = [c for c in lm_cats_flat if c.get("is_group")]
-        lm_cats   = [c for c in lm_cats_flat if not c.get("is_group")]
+        lm_groups = [c for c in lm_cats_flat if c.is_group]
+        lm_cats   = [c for c in lm_cats_flat if not c.is_group]
 
         print(f"\n{BOLD}─── Category Groups ───{RESET}")
         do_category_section(lm_groups, is_group=True)
@@ -853,8 +865,8 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
         existing = sync.account(ynab_id)
         if existing:
             plan.append({"action": _A_SYNCED, "acc": acc,
-                         "lm_id": existing["lm_id"], "lm_type": existing["lm_type"],
-                         "lm_name": existing["lm_name"]})
+                         "lm_id": existing.lm_id, "lm_type": existing.lm_type,
+                         "lm_name": existing.lm_name})
             continue
 
         # Crash recovery: already created in LM but not yet in sync_state
@@ -1003,9 +1015,9 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
         if action == _A_CREATE:
             result = client.create_manual_account(item["lm_payload"])
             sync.set_account(acc["id"], lm_type="manual",
-                             lm_id=result["id"], lm_name=result["name"])
+                             lm_id=result.id, lm_name=result.name)
             sync.save(sync_dir)
-            print(f"  {GREEN}✓{RESET} Created  '{acc['name']}'  → LM manual {result['id']}")
+            print(f"  {GREEN}✓{RESET} Created  '{acc['name']}'  → LM manual {result.id}")
             changes += 1
 
         elif action == _A_RECOVER:
