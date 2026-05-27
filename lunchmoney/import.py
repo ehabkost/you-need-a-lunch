@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lm_api_types_generated import CategoryObject, ChildCategoryObject, ManualAccountObject, PlaidAccountObject
+from lm_api_types_generated import CategoryObject, ChildCategoryObject, ManualAccountObject, PlaidAccountObject, UpdateManualAccountRequestObject
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping, MappingData, AccountMapping
 from sync_state import SyncState
@@ -883,20 +883,77 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient) -> None:
 
 # Actions for the account plan
 _A_CREATE        = "create"         # create a new LM manual account
+_A_UPDATE        = "update"         # update fields on an already-synced manual account
 _A_SYNCED        = "already_synced" # already recorded in sync_state, nothing to do
 _A_RECOVER       = "recover"        # found in LM by external_id, record in sync_state
 _A_PLAID         = "match_plaid"    # matched to an existing LM Plaid account
 _A_PLAID_RO      = "skip_plaid_ro"  # Plaid match found but read-only — skip
 _A_DELETED       = "skip_deleted"   # YNAB account is deleted
 
+# Fields that can be updated on already-synced manual accounts
+UPDATABLE_FIELDS = ["name", "institution_name", "type", "subtype", "custom_metadata"]
+
+
+def _build_update_payload(acc: dict[str, Any], meta: dict[str, Any],
+                           lm_acc: ManualAccountObject,
+                           update_fields: list[str],
+                           institutions_data: dict) -> dict[str, Any]:
+    """Compute which fields differ between YNAB-derived values and the current LM account."""
+    currency = meta["currency"].lower()
+
+    lm_type_tuple = YNAB_TO_LM_TYPE.get(acc.get("type", ""), ("other asset", None))
+    lm_type, lm_subtype = lm_type_tuple if isinstance(lm_type_tuple, tuple) else (lm_type_tuple, None)
+
+    custom: dict[str, Any] = {"ynab_type": acc.get("type"), "ynab_on_budget": acc.get("on_budget")}
+    if acc.get("direct_import_linked"):
+        custom["ynab_bank_synced"] = True
+    if acc.get("note"):
+        custom["ynab_note"] = acc["note"]
+
+    institution = detect_institution(acc["name"], institutions_data)
+    kw = detect_account_keyword(acc["name"], institutions_data)
+    if kw:
+        if "type" in kw:
+            lm_type = kw["type"]
+        if "subtype" in kw:
+            lm_subtype = kw["subtype"]
+
+    desired: dict[str, Any] = {
+        "name":             acc["name"][:45],
+        "institution_name": institution,
+        "type":             lm_type,
+        "subtype":          lm_subtype,
+        "custom_metadata":  custom,
+    }
+
+    current: dict[str, Any] = {
+        "name":             lm_acc.name,
+        "institution_name": lm_acc.institution_name,
+        "type":             lm_acc.type,
+        "subtype":          lm_acc.subtype,
+        "custom_metadata":  lm_acc.custom_metadata,
+    }
+
+    diff: dict[str, Any] = {}
+    for field in update_fields:
+        if field not in desired:
+            continue
+        new_val = desired[field]
+        old_val = current.get(field)
+        if new_val != old_val:
+            diff[field] = {"old": old_val, "new": new_val}
+    return diff
+
 
 def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any],
                          sync: SyncState,
                          lm_manual: list[ManualAccountObject],
-                         lm_plaid: list[PlaidAccountObject]) -> list[dict[str, Any]]:
+                         lm_plaid: list[PlaidAccountObject],
+                         update_fields: list[str] | None = None) -> list[dict[str, Any]]:
     currency = meta["currency"].lower()
     institutions_data = _load_institutions()
 
+    lm_manual_by_id:  dict[int, ManualAccountObject] = {a.id: a for a in lm_manual}
     lm_manual_by_ext: dict[str, ManualAccountObject] = {
         a.external_id: a for a in lm_manual if a.external_id
     }
@@ -914,6 +971,15 @@ def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any
 
         existing = sync.account(ynab_id)
         if existing:
+            if update_fields and existing.lm_type == "manual":
+                lm_acc = lm_manual_by_id.get(existing.lm_id)
+                if lm_acc:
+                    diff = _build_update_payload(acc, meta, lm_acc, update_fields, institutions_data)
+                    if diff:
+                        plan.append({"action": _A_UPDATE, "acc": acc,
+                                     "lm_id": existing.lm_id, "lm_name": existing.lm_name,
+                                     "diff": diff})
+                        continue
             plan.append({"action": _A_SYNCED, "acc": acc,
                          "lm_id": existing.lm_id, "lm_type": existing.lm_type,
                          "lm_name": existing.lm_name})
@@ -986,13 +1052,15 @@ def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any
 
 
 def _print_account_plan(plan: list[dict[str, Any]], apply: bool) -> None:
-    counts = {k: 0 for k in (_A_CREATE, _A_SYNCED, _A_RECOVER, _A_PLAID,
+    counts = {k: 0 for k in (_A_CREATE, _A_UPDATE, _A_SYNCED, _A_RECOVER, _A_PLAID,
                                _A_PLAID_RO, _A_DELETED)}
     for item in plan:
         counts[item["action"]] += 1
 
     verb = "Will" if apply else "Would"
     print(f"\n  {verb} create  {counts[_A_CREATE]:3} manual account(s)")
+    if counts[_A_UPDATE]:
+        print(f"  {verb} update  {counts[_A_UPDATE]:3} already-synced account(s)")
     if counts[_A_RECOVER]:
         print(f"  {verb} recover {counts[_A_RECOVER]:3} already-created account(s) into sync state")
     if counts[_A_PLAID]:
@@ -1004,7 +1072,14 @@ def _print_account_plan(plan: list[dict[str, Any]], apply: bool) -> None:
     if counts[_A_DELETED]:
         print(f"  Skip     {counts[_A_DELETED]:3} deleted account(s)")
 
-    if counts[_A_CREATE] == 0 and counts[_A_RECOVER] == 0 and counts[_A_PLAID] == 0:
+    if counts[_A_UPDATE]:
+        print(f"\n    {CYAN}Updates{RESET}")
+        for item in (i for i in plan if i["action"] == _A_UPDATE):
+            print(f"      {item['acc']['name']}  (LM {item['lm_id']})")
+            for field, chg in item["diff"].items():
+                print(f"        {field}: {chg['old']!r} → {chg['new']!r}")
+
+    if counts[_A_CREATE] == 0 and counts[_A_UPDATE] == 0 and counts[_A_RECOVER] == 0 and counts[_A_PLAID] == 0:
         return
 
     on_budget  = [i for i in plan if i["action"] == _A_CREATE and i["acc"].get("on_budget")]
@@ -1046,7 +1121,9 @@ def _print_account_plan(plan: list[dict[str, Any]], apply: bool) -> None:
 
 
 def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
-                   meta: dict[str, Any], apply: bool) -> int:
+                   meta: dict[str, Any], apply: bool,
+                   update_fields: list[str] | None = None,
+                   confirm_each: bool = False) -> int:
     """Plan and optionally execute account sync. Returns count of changes made."""
     ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
 
@@ -1054,16 +1131,17 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
     lm_manual = client.get_manual_accounts()
     lm_plaid  = client.get_plaid_accounts()
 
-    plan = _build_account_plan(ynab_accounts, meta, sync, lm_manual, lm_plaid)
+    plan = _build_account_plan(ynab_accounts, meta, sync, lm_manual, lm_plaid,
+                                update_fields=update_fields)
     _print_account_plan(plan, apply)
 
-    actionable = [i for i in plan if i["action"] in (_A_CREATE, _A_RECOVER, _A_PLAID)]
+    actionable = [i for i in plan if i["action"] in (_A_CREATE, _A_UPDATE, _A_RECOVER, _A_PLAID)]
     if not actionable:
         print(f"\n  {GREEN}Nothing to do.{RESET}")
         return 0
 
     if not apply:
-        print(f"\n  {DIM}(dry-run — pass --apply to create){RESET}")
+        print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
         return 0
 
     print()
@@ -1072,12 +1150,25 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
         action = item["action"]
         acc    = item["acc"]
 
+        if confirm_each and action in (_A_CREATE, _A_UPDATE, _A_RECOVER, _A_PLAID):
+            resp = input(f"  Apply '{acc['name']}' [{action}]? [y/N] ").strip().lower()
+            if resp != "y":
+                print(f"  {DIM}Skipped.{RESET}")
+                continue
+
         if action == _A_CREATE:
             result = client.create_manual_account(item["lm_payload"])
             sync.set_account(acc["id"], lm_type="manual",
                              lm_id=result.id, lm_name=result.name)
             sync.save(sync_dir)
             print(f"  {GREEN}✓{RESET} Created  '{acc['name']}'  → LM manual {result.id}")
+            changes += 1
+
+        elif action == _A_UPDATE:
+            update_data = {f: v["new"] for f, v in item["diff"].items()}
+            client.update_manual_account(item["lm_id"],
+                                          UpdateManualAccountRequestObject(**update_data))
+            print(f"  {GREEN}✓{RESET} Updated  '{acc['name']}'  (LM {item['lm_id']})")
             changes += 1
 
         elif action == _A_RECOVER:
@@ -1099,7 +1190,9 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
 
 # ── import command ────────────────────────────────────────────────────────────
 
-def cmd_import(data_dir: Path, client: LMClient, apply: bool) -> None:
+def cmd_import(data_dir: Path, client: LMClient, apply: bool,
+               update_fields: list[str] | None = None,
+               confirm_each: bool = False) -> None:
     meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     print("Fetching Lunch Money user info...")
@@ -1119,7 +1212,8 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool) -> None:
     print(BOLD + f"\nImporting {label}  [{mode}]\n" + RESET)
 
     print(BOLD + "── Accounts ──" + RESET)
-    phase_accounts(data_dir, client, sync, sync_dir, meta, apply)
+    phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
+                   update_fields=update_fields, confirm_each=confirm_each)
 
     # Future phases (categories, transactions) go here
 
@@ -1142,6 +1236,18 @@ def main() -> None:
     sub.add_parser("audit",         help="Verify every LM entity maps to a YNAB entity")
     p_import = sub.add_parser("import", help="Import YNAB data into LM (dry-run by default)")
     p_import.add_argument("--apply", action="store_true", help="Apply changes (default: dry-run)")
+    p_import.add_argument(
+        "--update-fields",
+        metavar="FIELDS",
+        help=(
+            f"Comma-separated fields to update on already-synced manual accounts, "
+            f"or 'all'. Valid fields: {', '.join(UPDATABLE_FIELDS)}"
+        ),
+    )
+    p_import.add_argument(
+        "--confirm-each", action="store_true",
+        help="Prompt for confirmation before applying each individual change",
+    )
 
     args = parser.parse_args()
     data_dir = Path(args.data)
@@ -1167,7 +1273,20 @@ def main() -> None:
         cmd_audit(data_dir, client)
 
     elif args.cmd == "import":
-        cmd_import(data_dir, client, apply=args.apply)
+        update_fields: list[str] | None = None
+        if args.update_fields:
+            raw = args.update_fields.strip()
+            if raw == "all":
+                update_fields = list(UPDATABLE_FIELDS)
+            else:
+                update_fields = [f.strip() for f in raw.split(",")]
+                unknown = [f for f in update_fields if f not in UPDATABLE_FIELDS]
+                if unknown:
+                    print(f"Error: unknown update field(s): {', '.join(unknown)}", file=sys.stderr)
+                    print(f"Valid fields: {', '.join(UPDATABLE_FIELDS)}", file=sys.stderr)
+                    sys.exit(1)
+        cmd_import(data_dir, client, apply=args.apply,
+                   update_fields=update_fields, confirm_each=args.confirm_each)
 
 
 if __name__ == "__main__":
