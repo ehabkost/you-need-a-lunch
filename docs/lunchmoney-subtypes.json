@@ -1,0 +1,242 @@
+{
+    "cash": [
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 1,
+            "subtype_name": "checking"
+        },
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 2,
+            "subtype_name": "savings"
+        },
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 3,
+            "subtype_name": "digital wallet (paypal, venmo)"
+        },
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 4,
+            "subtype_name": "physical cash"
+        },
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 31,
+            "subtype_name": "gift card"
+        },
+        {
+            "type_id": 1,
+            "type_name": "cash",
+            "type_order": 1,
+            "subtype_id": 32,
+            "subtype_name": "store credit"
+        }
+    ],
+    "credit": [
+        {
+            "type_id": 2,
+            "type_name": "credit",
+            "type_order": 2,
+            "subtype_id": 30,
+            "subtype_name": "rewards credit card"
+        },
+        {
+            "type_id": 2,
+            "type_name": "credit",
+            "type_order": 2,
+            "subtype_id": 29,
+            "subtype_name": "credit card"
+        },
+        {
+            "type_id": 2,
+            "type_name": "credit",
+            "type_order": 2,
+            "subtype_id": 28,
+            "subtype_name": "secured credit card"
+        }
+    ],
+    "cryptocurrency": [
+        {
+            "type_id": 7,
+            "type_name": "cryptocurrency",
+            "type_order": 3,
+            "subtype_id": 25,
+            "subtype_name": "ethereum (eth)"
+        },
+        {
+            "type_id": 7,
+            "type_name": "cryptocurrency",
+            "type_order": 3,
+            "subtype_id": 24,
+            "subtype_name": "bitcoin (btc)"
+        }
+    ],
+    "investment": [
+        {
+            "type_id": 3,
+            "type_name": "investment",
+            "type_order": 4,
+            "subtype_id": 7,
+            "subtype_name": "brokerage"
+        },
+        {
+            "type_id": 3,
+            "type_name": "investment",
+            "type_order": 4,
+            "subtype_id": 8,
+            "subtype_name": "health savings"
+        },
+        {
+            "type_id": 3,
+            "type_name": "investment",
+            "type_order": 4,
+            "subtype_id": 5,
+            "subtype_name": "retirement"
+        },
+        {
+            "type_id": 3,
+            "type_name": "investment",
+            "type_order": 4,
+            "subtype_id": 6,
+            "subtype_name": "education savings"
+        }
+    ],
+    "loan": [
+        {
+            "type_id": 4,
+            "type_name": "loan",
+            "type_order": 5,
+            "subtype_id": 11,
+            "subtype_name": "student loan"
+        },
+        {
+            "type_id": 4,
+            "type_name": "loan",
+            "type_order": 5,
+            "subtype_id": 12,
+            "subtype_name": "car loan"
+        },
+        {
+            "type_id": 4,
+            "type_name": "loan",
+            "type_order": 5,
+            "subtype_id": 13,
+            "subtype_name": "line of credit"
+        },
+        {
+            "type_id": 4,
+            "type_name": "loan",
+            "type_order": 5,
+            "subtype_id": 9,
+            "subtype_name": "mortgage"
+        },
+        {
+            "type_id": 4,
+            "type_name": "loan",
+            "type_order": 5,
+            "subtype_id": 10,
+            "subtype_name": "medical debt"
+        }
+    ],
+    "real estate": [
+        {
+            "type_id": 5,
+            "type_name": "real estate",
+            "type_order": 6,
+            "subtype_id": 15,
+            "subtype_name": "investment property"
+        },
+        {
+            "type_id": 5,
+            "type_name": "real estate",
+            "type_order": 6,
+            "subtype_id": 17,
+            "subtype_name": "commercial property"
+        },
+        {
+            "type_id": 5,
+            "type_name": "real estate",
+            "type_order": 6,
+            "subtype_id": 18,
+            "subtype_name": "land"
+        },
+        {
+            "type_id": 5,
+            "type_name": "real estate",
+            "type_order": 6,
+            "subtype_id": 14,
+            "subtype_name": "primary residence"
+        },
+        {
+            "type_id": 5,
+            "type_name": "real estate",
+            "type_order": 6,
+            "subtype_id": 16,
+            "subtype_name": "vacation home"
+        }
+    ],
+    "vehicle": [
+        {
+            "type_id": 6,
+            "type_name": "vehicle",
+            "type_order": 7,
+            "subtype_id": 20,
+            "subtype_name": "motorcycle"
+        },
+        {
+            "type_id": 6,
+            "type_name": "vehicle",
+            "type_order": 7,
+            "subtype_id": 23,
+            "subtype_name": "scooter"
+        },
+        {
+            "type_id": 6,
+            "type_name": "vehicle",
+            "type_order": 7,
+            "subtype_id": 22,
+            "subtype_name": "snowmobile"
+        },
+        {
+            "type_id": 6,
+            "type_name": "vehicle",
+            "type_order": 7,
+            "subtype_id": 21,
+            "subtype_name": "boat"
+        },
+        {
+            "type_id": 6,
+            "type_name": "vehicle",
+            "type_order": 7,
+            "subtype_id": 19,
+            "subtype_name": "automobile"
+        }
+    ],
+    "employee compensation": [
+        {
+            "type_id": 8,
+            "type_name": "employee compensation",
+            "type_order": 8,
+            "subtype_id": 27,
+            "subtype_name": "stock options"
+        },
+        {
+            "type_id": 8,
+            "type_name": "employee compensation",
+            "type_order": 8,
+            "subtype_id": 26,
+            "subtype_name": "restricted stock units"
+        }
+    ]
+}

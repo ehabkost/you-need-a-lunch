@@ -41,11 +41,11 @@ LM_CACHE_FILE = "lm_cache.json"
 YNAB_TO_LM_TYPE = {
     "checking":      ("cash", "checking"),
     "savings":       ("cash", "savings"),
-    "cash":          ("cash", None),
-    "creditCard":    ("credit", None),
-    "lineOfCredit":  ("loan", None),
-    "mortgage":      ("loan", None),
-    "autoLoan":      ("loan", None),
+    "cash":          ("cash", "physical cash"),
+    "creditCard":    ("credit", "credit card"),
+    "lineOfCredit":  ("loan", "line of credit"),
+    "mortgage":      ("loan", "mortgage"),
+    "autoLoan":      ("loan", "car loan"),
     "otherAsset":    ("other asset", None),
     "otherLiability":("other liability", None),
 }
