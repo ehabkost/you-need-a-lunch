@@ -50,7 +50,9 @@ class LMClient:
     # ── reads ─────────────────────────────────────────────────────────────────
 
     def get_me(self) -> dict:
-        return self.get("/me")["user"]
+        resp = self.get("/me")
+        # Real API wraps in {"user": {...}}, mock API returns directly
+        return resp.get("user", resp)
 
     def get_manual_accounts(self) -> list[dict]:
         return self.get("/manual_accounts")["manual_accounts"]

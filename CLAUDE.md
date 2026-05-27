@@ -18,12 +18,15 @@ data/       # intermediate export files (gitignored)
 
 ## Secrets and Authentication
 
-All tools must read secrets exclusively from environment variables — no config files, no hardcoded values, no interactive prompts for credentials. This allows secrets to be injected via `op run` (1Password CLI) or `wsl-op-run` without any code changes:
+All tools must read secrets exclusively from environment variables — no config files, no hardcoded values, no interactive prompts for credentials. Secrets are injected via `wsl-op-run` using the wrapper scripts:
 
 ```sh
-op run -- python exporter/export.py
-wsl-op-run python importer/import.py --since 2y
+./prod-run.sh python exporter/export.py       # uses .env.production
+./test-run.sh python importer/import.py --since 2y  # uses .env.testing
 ```
+
+- `.env.production` — production YNAB + Lunch Money credentials
+- `.env.testing` — test Lunch Money account only (no YNAB token for now)
 
 ### Environment variables
 
@@ -279,7 +282,11 @@ After import, the user may have manually entered transactions in LM that duplica
 
 **Why grouping alone doesn't work for deduplication:** the group parent's `amount` is the *sum* of all children. Grouping two ×$50 transactions yields a $100 group — double-counting. LM has no merge/replace API (confirmed by LM support as of May 2026).
 
-**Resolution:** delete the manual transaction and store its full JSON in `custom_metadata.matched_manual` on the surviving (Plaid/imported) transaction. This gives a complete audit trail and allows manual recovery if the match turns out to be wrong. Note: `custom_metadata` is capped at 4096 characters when stringified; a typical transaction object is ~500–800 chars so this should fit comfortably.
+**Grouping workaround:** one possible workaround is to zero out the manual transaction's amount and keep the real amount only on the Plaid transaction, then group both — the group total then equals the Plaid amount. This avoids double-counting without deleting either leg, at the cost of a zero-amount orphan entry.
+
+**Resolution (preferred):** delete the manual transaction and store its full JSON in `custom_metadata.matched_manual` on the surviving (Plaid/imported) transaction. This gives a complete audit trail and allows manual recovery if the match turns out to be wrong. Note: `custom_metadata` is capped at 4096 characters when stringified; a typical transaction object is ~500–800 chars so this should fit comfortably.
+
+**Feature tracking:** native auto-linking of manually created transactions to synced ones is tracked upstream at https://feedback.lunchmoney.app/transactions/p/auto-link-manually-created-transactions-to-synced-transactions — if that ships, the matching tool may become unnecessary.
 
 ### Transfer Management Tool
 Transfers in YNAB create two linked transaction legs (one per account). In LM the recommended approach (per LM support) is:
@@ -309,5 +316,5 @@ This is low priority but the account-exclude feature should be kept in mind when
 - Export files in `data/` are the source of truth for the import phase — exporter and importer are independent scripts
 - YNAB `deleted: true` records should be exported (for completeness) but not imported
 - YNAB internal categories (e.g. "Inflow: Ready to Assign") have `internal: true` — skip during import
-- Local sync state is stored in `data/<slug>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions. Machine-generated; do not edit manually.
+- Local sync state is stored in `data/<slug>/<lm_account_id>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions, keyed by LM account ID. This allows the same YNAB budget to be imported to multiple LM accounts. Machine-generated; do not edit manually.
 - LM metadata storage: accounts use `external_id` (YNAB UUID) and `custom_metadata` (YNAB type/flags); categories and transactions use `custom_metadata` only (no `external_id` field available)

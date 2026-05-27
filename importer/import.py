@@ -955,7 +955,7 @@ def _print_account_plan(plan: list, apply: bool):
             print(f"      {item['acc']['name']}  → LM Plaid '{item['lm_name']}'")
 
 
-def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState,
+def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
                    meta: dict, apply: bool) -> int:
     """Plan and optionally execute account sync. Returns count of changes made."""
     ynab_accounts: list = load_json(data_dir, "accounts")
@@ -986,21 +986,21 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState,
             result = client.create_manual_account(item["lm_payload"])
             sync.set_account(acc["id"], lm_type="manual",
                              lm_id=result["id"], lm_name=result["name"])
-            sync.save(data_dir)
+            sync.save(sync_dir)
             print(f"  {GREEN}✓{RESET} Created  '{acc['name']}'  → LM manual {result['id']}")
             changes += 1
 
         elif action == _A_RECOVER:
             sync.set_account(acc["id"], lm_type="manual",
                              lm_id=item["lm_id"], lm_name=item["lm_name"])
-            sync.save(data_dir)
+            sync.save(sync_dir)
             print(f"  {GREEN}✓{RESET} Recovered '{acc['name']}'  → LM manual {item['lm_id']}")
             changes += 1
 
         elif action == _A_PLAID:
             sync.set_account(acc["id"], lm_type="plaid",
                              lm_id=item["lm_id"], lm_name=item["lm_name"])
-            sync.save(data_dir)
+            sync.save(sync_dir)
             print(f"  {GREEN}✓{RESET} Linked   '{acc['name']}'  → LM Plaid {item['lm_id']}")
             changes += 1
 
@@ -1011,8 +1011,14 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState,
 
 def cmd_import(data_dir: Path, client: LMClient, apply: bool):
     meta: dict = load_json(data_dir, "export_metadata")
-    sync = SyncState.load_or_create(
+
+    print("Fetching Lunch Money user info...")
+    me = client.get_me()
+    lm_account_id = me["account_id"]
+
+    sync, sync_dir = SyncState.load_or_create(
         data_dir,
+        lm_account_id=lm_account_id,
         ynab_budget_id=meta["budget_id"],
         ynab_budget_name=meta["budget_name"],
         currency=meta["currency"].lower(),
@@ -1023,14 +1029,14 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool):
     print(BOLD + f"\nImporting {label}  [{mode}]\n" + RESET)
 
     print(BOLD + "── Accounts ──" + RESET)
-    phase_accounts(data_dir, client, sync, meta, apply)
+    phase_accounts(data_dir, client, sync, sync_dir, meta, apply)
 
     # Future phases (categories, transactions) go here
 
     if not apply:
         print(f"\n{DIM}Run with --apply to execute the above changes.{RESET}\n")
     else:
-        print(f"\n{GREEN}Done.{RESET}  Sync state: {data_dir / 'sync_state.json'}\n")
+        print(f"\n{GREEN}Done.{RESET}  Sync state: {sync_dir / 'sync_state.json'}\n")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

@@ -1,12 +1,13 @@
 """Local sync state: records YNAB↔LM ID mappings built during import runs.
 
-File: data/<slug>/sync_state.json
+File: data/<slug>/<lm_account_id>/sync_state.json
 Machine-generated — do not edit manually.
 
 Schema:
   schema_version: 1
   ynab_budget_id: str
   ynab_budget_name: str
+  lm_account_id: int      # Lunch Money account ID (keyed by LM user)
   currency: str           # lowercase ISO 4217
   last_updated: str       # ISO 8601
   accounts:
@@ -32,7 +33,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 SYNC_STATE_FILE = "sync_state.json"
 SCHEMA_VERSION = 1
@@ -47,9 +48,12 @@ class SyncState:
         self._d = data
 
     @classmethod
-    def load_or_create(cls, data_dir: Path, ynab_budget_id: str,
-                        ynab_budget_name: str, currency: str) -> "SyncState":
-        path = data_dir / SYNC_STATE_FILE
+    def load_or_create(cls, data_dir: Path, lm_account_id: int, ynab_budget_id: str,
+                        ynab_budget_name: str, currency: str) -> Tuple["SyncState", Path]:
+        sync_dir = data_dir / str(lm_account_id)
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        path = sync_dir / SYNC_STATE_FILE
+
         if path.exists():
             data = json.loads(path.read_text())
         else:
@@ -57,16 +61,17 @@ class SyncState:
                 "schema_version": SCHEMA_VERSION,
                 "ynab_budget_id": ynab_budget_id,
                 "ynab_budget_name": ynab_budget_name,
+                "lm_account_id": lm_account_id,
                 "currency": currency,
                 "accounts": {},
                 "category_groups": {},
                 "categories": {},
             }
-        return cls(data)
+        return cls(data), sync_dir
 
-    def save(self, data_dir: Path):
+    def save(self, sync_dir: Path):
         self._d["last_updated"] = _now()
-        (data_dir / SYNC_STATE_FILE).write_text(
+        (sync_dir / SYNC_STATE_FILE).write_text(
             json.dumps(self._d, indent=2, ensure_ascii=False)
         )
 
