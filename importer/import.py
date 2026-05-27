@@ -902,6 +902,8 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
         }
         if lm_subtype:
             payload["subtype"] = lm_subtype
+        if acc.get("closed"):
+            payload["exclude_from_transactions"] = True
         # Note: YNAB doesn't track closure dates, only a boolean flag
         # Users can set closed_on manually in LM if needed
 
