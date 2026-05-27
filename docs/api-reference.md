@@ -79,6 +79,8 @@ Base URL: `https://api.lunchmoney.dev/v2`
 
 ### Manual Accounts (formerly Assets)
 - Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `external_id`, `custom_metadata`, `exclude_from_transactions`, `closed_on`
+- Valid `type` values: `cash`, `credit`, `cryptocurrency`, `employee compensation`, `investment`, `loan`, `other liability`, `other asset`, `real estate`, `vehicle`
+  - Note: YNAB's `checking` and `savings` types map to `other asset` (LM has no dedicated checking/savings type)
 - `external_id`: **fully qualified YNAB account identifier** in format `ynab:{budget_id}:{account_id}` (e.g. `ynab:a1b2c3d4-e5f6-7890-abcd-ef1234567890:1a2b3c4d-5e6f-7890-abcd-ef1234567890`) for unambiguous deduplication when re-importing or importing the same budget to multiple LM accounts
 - `custom_metadata`: freeform JSON; use to store additional YNAB account info (e.g. `{"ynab_name": "...", "ynab_type": "..."}`) that may be useful for debugging or re-runs
 - `closed_on`: optional ISO 8601 date indicating when the account was closed (prevents future activity)

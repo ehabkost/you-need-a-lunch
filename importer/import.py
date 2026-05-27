@@ -29,13 +29,13 @@ LM_CACHE_FILE = "lm_cache.json"
 # ── YNAB account type → LM account type ──────────────────────────────────────
 
 YNAB_TO_LM_TYPE = {
-    "checking":      "checking",
-    "savings":       "savings",
+    "checking":      "other asset",  # LM has no dedicated checking type
+    "savings":       "other asset",  # LM has no dedicated savings type
     "cash":          "cash",
     "creditCard":    "credit",
     "lineOfCredit":  "loan",
     "mortgage":      "other liability",
-    "autoLoan":      "other liability",
+    "autoLoan":      "loan",
     "otherAsset":    "other asset",
     "otherLiability":"other liability",
 }
