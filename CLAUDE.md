@@ -104,7 +104,7 @@ See **[docs/multi-budget.md](docs/multi-budget.md)** for:
 - YNAB internal categories have `internal: true`:
   - "Starting Balance" zero-amount entries → skip (pure metadata)
   - "Starting Balance" non-zero entries → import (opening balance for account, needed for reconciliation)
-  - "Inflow: Ready to Assign" income → map to Income category in LM
-  - Other internal categories → map to catch-all category (e.g., Uncategorized)
+  - "Inflow: Ready to Assign" → map to Income category in LM
+  - Other internal categories → if found in data, ask user how to handle (warn and require confirmation)
 - Local sync state is stored in `data/<slug>/<lm_account_id>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions, keyed by LM account ID. This allows the same YNAB budget to be imported to multiple LM accounts. Machine-generated; do not edit manually.
 - LM metadata storage: accounts use `external_id` (YNAB UUID) and `custom_metadata` (YNAB type/flags); categories and transactions use `custom_metadata` only (no `external_id` field available)
