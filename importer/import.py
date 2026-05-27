@@ -26,18 +26,18 @@ from sync_state import SyncState
 
 LM_CACHE_FILE = "lm_cache.json"
 
-# ── YNAB account type → LM account type ──────────────────────────────────────
+# ── YNAB account type → LM account (type, subtype) ──────────────────────────
 
 YNAB_TO_LM_TYPE = {
-    "checking":      "other asset",  # LM has no dedicated checking type
-    "savings":       "other asset",  # LM has no dedicated savings type
-    "cash":          "cash",
-    "creditCard":    "credit",
-    "lineOfCredit":  "loan",
-    "mortgage":      "loan",
-    "autoLoan":      "loan",
-    "otherAsset":    "other asset",
-    "otherLiability":"other liability",
+    "checking":      ("cash", "checking"),
+    "savings":       ("cash", "savings"),
+    "cash":          ("cash", None),
+    "creditCard":    ("credit", None),
+    "lineOfCredit":  ("loan", None),
+    "mortgage":      ("loan", None),
+    "autoLoan":      ("loan", None),
+    "otherAsset":    ("other asset", None),
+    "otherLiability":("other liability", None),
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -879,7 +879,13 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
                 continue
 
         # Create as manual account
-        lm_type = YNAB_TO_LM_TYPE.get(acc.get("type", ""), "other asset")
+        lm_type_tuple = YNAB_TO_LM_TYPE.get(acc.get("type", ""), ("other asset", None))
+        if isinstance(lm_type_tuple, tuple):
+            lm_type, lm_subtype = lm_type_tuple
+        else:
+            # Fallback for backward compatibility
+            lm_type, lm_subtype = lm_type_tuple, None
+
         custom = {"ynab_type": acc.get("type"), "ynab_on_budget": acc.get("on_budget")}
         if acc.get("direct_import_linked"):
             custom["ynab_bank_synced"] = True  # was direct-import in YNAB, no Plaid match
@@ -894,8 +900,10 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
             "external_id": ynab_id,
             "custom_metadata": custom,
         }
+        if lm_subtype:
+            payload["subtype"] = lm_subtype
         if acc.get("closed"):
-            payload["status"] = "closed"
+            payload["closed_on"] = acc.get("closed")  # Store closure date if available
 
         plan.append({"action": _A_CREATE, "acc": acc, "lm_type": "manual",
                      "lm_payload": payload})
@@ -938,8 +946,13 @@ def _print_account_plan(plan: list, apply: bool):
             if acc.get("closed"):               flags.append("closed")
             if acc.get("direct_import_linked"): flags.append("was-synced")
             flag_s = f"  ({', '.join(flags)})" if flags else ""
-            lm_type = YNAB_TO_LM_TYPE.get(acc.get("type", ""), "other asset")
-            print(f"      {acc['name']}{flag_s}  [{acc.get('type')} → {lm_type}]")
+            lm_type_tuple = YNAB_TO_LM_TYPE.get(acc.get("type", ""), ("other asset", None))
+            if isinstance(lm_type_tuple, tuple):
+                lm_type, lm_subtype = lm_type_tuple
+                lm_display = f"{lm_type}/{lm_subtype}" if lm_subtype else lm_type
+            else:
+                lm_display = lm_type_tuple
+            print(f"      {acc['name']}{flag_s}  [{acc.get('type')} → {lm_display}]")
 
     if on_budget or off_budget:
         print()
