@@ -102,7 +102,8 @@ See **[docs/multi-budget.md](docs/multi-budget.md)** for:
 - Export files in `data/` are the source of truth for the import phase — exporter and importer are independent scripts
 - YNAB `deleted: true` records should be exported (for completeness) but not imported
 - YNAB internal categories have `internal: true`:
-  - "Starting Balance" entries (zero-amount) → skip (metadata, not real transactions)
+  - "Starting Balance" zero-amount entries → skip (pure metadata)
+  - "Starting Balance" non-zero entries → import (opening balance for account, needed for reconciliation)
   - "Inflow: Ready to Assign" income → map to Income category in LM
   - Other internal categories → map to catch-all category (e.g., Uncategorized)
 - Local sync state is stored in `data/<slug>/<lm_account_id>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions, keyed by LM account ID. This allows the same YNAB budget to be imported to multiple LM accounts. Machine-generated; do not edit manually.
