@@ -59,7 +59,7 @@ Install:
 
 Run:
 ```bash
-.venv/bin/mypy importer/ --strict
+.venv/bin/mypy lunchmoney/ --strict
 ```
 
 **Advantages**:
@@ -83,7 +83,7 @@ Install:
 
 Run:
 ```bash
-.venv/bin/pyright importer/
+.venv/bin/pyright lunchmoney/
 ```
 
 **Advantages**:
@@ -102,7 +102,7 @@ Run:
 
 2. **CI/CD**: Run mypy in strict mode
    ```bash
-   .venv/bin/mypy importer/ --strict
+   .venv/bin/mypy lunchmoney/ --strict
    ```
 
 3. **Runtime**: Use TypedLMClient for validation

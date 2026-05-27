@@ -2,11 +2,11 @@
 """Lunch Money importer — import YNAB data into Lunch Money.
 
 Usage:
-  ./run.sh ./importer/import.py --data data/cad fix-mapping    # create/fix mapping.yaml interactively
-  ./run.sh ./importer/import.py --data data/cad show-mapping   # display mapping table (no API)
-  ./run.sh ./importer/import.py --data data/cad audit          # strict YNAB-first audit
-  ./run.sh ./importer/import.py --data data/cad import         # dry-run (not yet implemented)
-  ./run.sh ./importer/import.py --data data/cad import --apply # apply    (not yet implemented)
+  ./run.sh ./lunchmoney/import.py --data data/cad fix-mapping    # create/fix mapping.yaml interactively
+  ./run.sh ./lunchmoney/import.py --data data/cad show-mapping   # display mapping table (no API)
+  ./run.sh ./lunchmoney/import.py --data data/cad audit          # strict YNAB-first audit
+  ./run.sh ./lunchmoney/import.py --data data/cad import         # dry-run (not yet implemented)
+  ./run.sh ./lunchmoney/import.py --data data/cad import --apply # apply    (not yet implemented)
 """
 import argparse
 import json

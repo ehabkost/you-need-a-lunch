@@ -69,7 +69,7 @@ All API endpoints used by the importer have been validated against the OpenAPI s
 ### Running Validation
 
 ```bash
-.venv/bin/python3 importer/validate_api_calls.py
+.venv/bin/python3 lunchmoney/validate_api_calls.py
 ```
 
 ### Request Validation Results

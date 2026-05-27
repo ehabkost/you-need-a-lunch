@@ -6,4 +6,4 @@ help:
 
 check:
 	@echo "Running mypy type checker..."
-	@.venv/bin/mypy importer/ --strict 2>/dev/null || echo "Note: mypy not installed. Run: .venv/bin/pip install mypy"
+	@.venv/bin/mypy lunchmoney/ --strict 2>/dev/null || echo "Note: mypy not installed. Run: .venv/bin/pip install mypy"

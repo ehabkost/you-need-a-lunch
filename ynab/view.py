@@ -2,8 +2,8 @@
 """View YNAB exported data.
 
 Usage:
-  ./exporter/view.py <data-dir> accounts
-  ./exporter/view.py <data-dir> budget [YYYY-MM]
+  ./ynab/view.py <data-dir> accounts
+  ./ynab/view.py <data-dir> budget [YYYY-MM]
 """
 import json
 import sys

@@ -14,7 +14,7 @@ This project uses the Lunch Money v2 OpenAPI spec to validate all API requests a
 Run the schema validation tests:
 
 ```bash
-.venv/bin/python3 importer/validate_api_calls.py
+.venv/bin/python3 lunchmoney/validate_api_calls.py
 ```
 
 Expected output:
@@ -29,7 +29,7 @@ Validates request/response bodies against JSON schemas.
 
 **Usage**: 
 ```bash
-.venv/bin/python3 importer/validate_api_calls.py
+.venv/bin/python3 lunchmoney/validate_api_calls.py
 ```
 
 **What it checks**:

@@ -11,8 +11,8 @@ The tool is intentionally scoped to one-way migration for now. It is not a sync 
 ## Project Structure (planned)
 
 ```
-exporter/   # reads from YNAB API, writes to local JSON files
-importer/   # reads local JSON files, writes to Lunch Money API
+ynab/        # reads from YNAB API, writes to local JSON files
+lunchmoney/  # reads local JSON files, writes to Lunch Money API
 data/       # intermediate export files (gitignored)
 ```
 
@@ -21,8 +21,8 @@ data/       # intermediate export files (gitignored)
 All tools must read secrets exclusively from environment variables — no config files, no hardcoded values, no interactive prompts for credentials. Secrets are injected via `wsl-op-run` using the wrapper scripts:
 
 ```sh
-./prod-run.sh python exporter/export.py       # uses .env.production
-./test-run.sh python importer/import.py --since 2y  # uses .env.testing
+./prod-run.sh python ynab/export.py       # uses .env.production
+./test-run.sh python lunchmoney/import.py --since 2y  # uses .env.testing
 ```
 
 - `.env.production` — production YNAB + Lunch Money credentials
@@ -32,9 +32,9 @@ All tools must read secrets exclusively from environment variables — no config
 
 | Variable | Used by |
 |---|---|
-| `YNAB_API_TOKEN` | exporter |
-| `YNAB_BUDGET_ID` | exporter |
-| `LUNCHMONEY_API_TOKEN` | importer |
+| `YNAB_API_TOKEN` | ynab/ |
+| `YNAB_BUDGET_ID` | ynab/ |
+| `LUNCHMONEY_API_TOKEN` | lunchmoney/ |
 
 If a required variable is missing, the tool must exit immediately with a clear error message naming the missing variable — never silently fall back or prompt.
 

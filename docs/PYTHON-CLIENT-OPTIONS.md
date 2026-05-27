@@ -88,7 +88,7 @@ new_account = client.create_manual_account(
 
 ### Regeneration
 ```bash
-cd importer
+cd lunchmoney
 ./regenerate_api_types.sh
 ```
 
@@ -151,7 +151,7 @@ pip install git+https://github.com/juftin/lunchmoney-clients.git
 ### What You Have
 
 ```
-importer/
+lunchmoney/
 ├── lm_client.py                    # Core HTTP client (113 lines)
 ├── lm_api_types_generated.py       # Auto-generated pydantic models (2689 lines)
 ├── lm_client_typed.py              # Validation wrapper
@@ -180,7 +180,7 @@ account = client.create_manual_account(
 When the Lunch Money API spec updates:
 
 ```bash
-cd importer
+cd lunchmoney
 ./regenerate_api_types.sh
 ```
 
