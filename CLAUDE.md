@@ -101,6 +101,9 @@ See **[docs/multi-budget.md](docs/multi-budget.md)** for:
 - Test against real Lunch Money test account using `.env.testing` (more realistic than mock server)
 - Export files in `data/` are the source of truth for the import phase — exporter and importer are independent scripts
 - YNAB `deleted: true` records should be exported (for completeness) but not imported
-- YNAB internal categories (e.g. "Inflow: Ready to Assign") have `internal: true` — skip during import
+- YNAB internal categories have `internal: true`:
+  - "Starting Balance" entries (zero-amount) → skip (metadata, not real transactions)
+  - "Inflow: Ready to Assign" income → map to Income category in LM
+  - Other internal categories → map to catch-all category (e.g., Uncategorized)
 - Local sync state is stored in `data/<slug>/<lm_account_id>/sync_state.json` — records YNAB↔LM ID mappings for accounts, categories, and transactions, keyed by LM account ID. This allows the same YNAB budget to be imported to multiple LM accounts. Machine-generated; do not edit manually.
 - LM metadata storage: accounts use `external_id` (YNAB UUID) and `custom_metadata` (YNAB type/flags); categories and transactions use `custom_metadata` only (no `external_id` field available)
