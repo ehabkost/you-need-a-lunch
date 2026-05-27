@@ -106,4 +106,3 @@ Lunch Money supports merging a manually-managed account with a synced (Plaid) ac
 
 ### Authentication
 - Bearer token via `Authorization: Bearer TOKEN`
-- Mock server for testing: `https://mock.lunchmoney.dev/v2`

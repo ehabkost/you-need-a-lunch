@@ -98,7 +98,7 @@ See **[docs/multi-budget.md](docs/multi-budget.md)** for:
 ## Implementation Notes
 
 - Importer must always print a **dry-run summary** (counts of creates/skips/conflicts per resource type) and prompt for confirmation before writing anything
-- Use the Lunch Money mock server (`https://mock.lunchmoney.dev/v2`) for development and testing
+- Test against real Lunch Money test account using `.env.testing` (more realistic than mock server)
 - Export files in `data/` are the source of truth for the import phase — exporter and importer are independent scripts
 - YNAB `deleted: true` records should be exported (for completeness) but not imported
 - YNAB internal categories (e.g. "Inflow: Ready to Assign") have `internal: true` — skip during import
