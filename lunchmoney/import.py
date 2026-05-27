@@ -50,6 +50,42 @@ YNAB_TO_LM_TYPE = {
     "otherLiability":("other liability", None),
 }
 
+# ── institution / investment-type detection ───────────────────────────────────
+
+_INSTITUTIONS_FILE = Path(__file__).parent.parent / "institutions.yaml"
+
+
+def _load_institutions() -> dict:
+    if not _INSTITUTIONS_FILE.exists():
+        return {"institutions": [], "account_keywords": []}
+    with open(_INSTITUTIONS_FILE) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _word_pattern(phrase: str) -> re.Pattern:
+    """Return a whole-word case-insensitive pattern for *phrase*."""
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?![A-Za-z0-9])",
+                      re.IGNORECASE)
+
+
+def detect_institution(account_name: str, institutions_data: dict) -> str | None:
+    """Return the canonical institution name if any keyword matches, else None."""
+    for entry in institutions_data.get("institutions", []):
+        for keyword in entry.get("match", []):
+            if _word_pattern(keyword).search(account_name):
+                return entry["name"]
+    return None
+
+
+def detect_account_keyword(account_name: str, institutions_data: dict) -> dict | None:
+    """Return the first matching account_keywords entry (may have type and/or subtype)."""
+    for entry in institutions_data.get("account_keywords", []):
+        for keyword in entry.get("match", []):
+            if _word_pattern(keyword).search(account_name):
+                return entry
+    return None
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def get_env(name: str) -> str:
@@ -859,6 +895,7 @@ def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any
                          lm_manual: list[ManualAccountObject],
                          lm_plaid: list[PlaidAccountObject]) -> list[dict[str, Any]]:
     currency = meta["currency"].lower()
+    institutions_data = _load_institutions()
 
     lm_manual_by_ext: dict[str, ManualAccountObject] = {
         a.external_id: a for a in lm_manual if a.external_id
@@ -925,7 +962,17 @@ def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any
             "external_id": ynab_id,
             "custom_metadata": custom,
         }
-        if lm_subtype:
+        institution = detect_institution(acc["name"], institutions_data)
+        if institution:
+            payload["institution_name"] = institution
+
+        kw = detect_account_keyword(acc["name"], institutions_data)
+        if kw:
+            if "type" in kw:
+                payload["type"] = kw["type"]
+            if "subtype" in kw:
+                payload["subtype"] = kw["subtype"]
+        elif lm_subtype:
             payload["subtype"] = lm_subtype
         if acc.get("closed"):
             payload["exclude_from_transactions"] = True

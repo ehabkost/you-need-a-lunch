@@ -1,0 +1,96 @@
+# Known institutions — matched against YNAB account names using whole-word matching.
+# The importer uses this to set institution_name on newly created LM manual accounts.
+#
+# Format:
+#   institutions:
+#     - match: [list of words/phrases to look for]
+#       name: canonical institution name for LM
+#
+# Matching is case-insensitive and whole-word (no substring matches).
+
+institutions:
+  - match: [CIBC]
+    name: CIBC
+  - match: [Questrade]
+    name: Questrade
+  - match: [RBC]
+    name: RBC
+  - match: [TD]
+    name: TD
+  - match: [Sunlife, "Sun Life"]
+    name: Sun Life
+  - match: [Manulife]
+    name: Manulife
+  - match: [Wise]
+    name: Wise
+  - match: [PayPal, Paypal]
+    name: PayPal
+  - match: ["Canada Life"]
+    name: Canada Life
+  - match: [Fidelity]
+    name: Fidelity
+  # Suggested additions — common Canadian/international institutions:
+  - match: [BMO, "Bank of Montreal"]
+    name: BMO
+  - match: [Scotiabank, Scotia]
+    name: Scotiabank
+  - match: [Tangerine]
+    name: Tangerine
+  - match: [EQ, "EQ Bank"]
+    name: EQ Bank
+  - match: [Wealthsimple]
+    name: Wealthsimple
+  - match: [Desjardins]
+    name: Desjardins
+  - match: ["National Bank", NBC]
+    name: National Bank
+  - match: [HSBC]
+    name: HSBC
+  - match: [Meridian]
+    name: Meridian
+  - match: [Simplii]
+    name: Simplii
+
+# Account type/subtype overrides inferred from account name keywords.
+# Each entry may set `type`, `subtype`, or both. When `type` is set, it overrides
+# the YNAB→LM type mapping. When only `subtype` is set, it fills in the subtype
+# if the YNAB→LM mapping left it blank.
+#
+# Valid LM types: cash, credit, investment, loan, real estate, vehicle,
+#   cryptocurrency, employee compensation, other asset, other liability
+#
+# Valid subtypes per type (from docs/lunchmoney-subtypes.json):
+#   investment:            brokerage, health savings, retirement, education savings
+#   employee compensation: stock options, restricted stock units
+#   cash:                  checking, savings, digital wallet (paypal, venmo),
+#                          physical cash, gift card, store credit
+#   credit:                credit card, rewards credit card, secured credit card
+
+account_keywords:
+  - match: [RRSP, RRSPs, RRSPS]
+    type: investment
+    subtype: retirement
+  - match: [TFSA]
+    type: investment
+  - match: [FHSA]
+    type: investment
+  - match: [RESP]
+    type: investment
+    subtype: education savings
+  - match: [RRIF]
+    type: investment
+    subtype: retirement
+  - match: [LIRA]
+    type: investment
+    subtype: retirement
+  - match: [Pension]
+    type: investment
+    subtype: retirement
+  - match: [ESPP]
+    type: employee compensation
+  - match: [GIC]
+    type: investment
+  - match: [Investment, Investments]
+    type: investment
+  - match: [Equity]
+    type: investment
