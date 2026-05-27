@@ -34,7 +34,7 @@ YNAB_TO_LM_TYPE = {
     "cash":          "cash",
     "creditCard":    "credit",
     "lineOfCredit":  "loan",
-    "mortgage":      "other liability",
+    "mortgage":      "loan",
     "autoLoan":      "loan",
     "otherAsset":    "other asset",
     "otherLiability":"other liability",
