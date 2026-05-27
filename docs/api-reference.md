@@ -78,9 +78,10 @@ Base URL: `https://api.lunchmoney.dev/v2`
 - `to_base`: read-only float, converts to user's primary currency; do not send in POST/PUT
 
 ### Manual Accounts (formerly Assets)
-- Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `external_id`, `custom_metadata`, `exclude_from_transactions`
+- Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `external_id`, `custom_metadata`, `exclude_from_transactions`, `closed_on`
 - `external_id`: use to store YNAB account UUID for deduplication on re-import
 - `custom_metadata`: freeform JSON; use to store additional YNAB account info (e.g. `{"ynab_name": "...", "ynab_type": "..."}`) that may be useful for debugging or re-runs
+- `closed_on`: optional ISO 8601 date indicating when the account was closed (prevents future activity)
 
 ### Plaid Accounts
 - Fields: `id`, `name`, `type`, `subtype`, `balance`, `currency`, `allow_transaction_modification`

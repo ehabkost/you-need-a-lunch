@@ -14,7 +14,10 @@ The migration is structured in phases, with each phase building on previous work
 2. Match against existing Lunch Money manual accounts (by name, or by `external_id` if re-running)
 3. For YNAB accounts with `direct_import_linked: true`, match to Lunch Money Plaid accounts by name (case-insensitive) — these must NOT be re-created as manual accounts; transactions into them should target the matched Plaid account if `allow_transaction_modification: true`, or be skipped if `allow_transaction_modification: false`
    - If no Plaid match is found: warn the user and skip the account (do not create a manual account). The user must resolve this manually — either by connecting Plaid sync in LM or by explicitly opting in to creating a manual account for it
-4. For closed YNAB accounts (`closed: true`): create as manual accounts in Lunch Money to preserve transaction history. Store `{"ynab_closed": true}` in `custom_metadata` and optionally set `exclude_from_transactions: true` if Lunch Money supports it (to prevent future activity on the account)
+4. For closed YNAB accounts (`closed: true`): create as manual accounts in Lunch Money to preserve transaction history. Set both:
+   - `closed_on`: account closure date (or import date if unknown)
+   - `exclude_from_transactions: true`: prevent accidental future activity
+   - Store `{"ynab_closed": true}` in `custom_metadata` for reference
 5. Create missing manual accounts in Lunch Money, storing YNAB UUID in `external_id`
 6. **Balance check**: after all transactions are imported, compare computed balance against YNAB's `cleared_balance` and `uncleared_balance`
 
