@@ -18,12 +18,13 @@ from typing import Any, Sequence
 
 import re
 
+from pydantic import BaseModel, Field
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lm_api_types_generated import CategoryObject, ChildCategoryObject, ManualAccountObject, PlaidAccountObject
 from lm_client import LMClient
-from mapping import MAPPING_FILE, Mapping
+from mapping import MAPPING_FILE, Mapping, MappingData, AccountMapping
 from sync_state import SyncState
 
 # Useful for some generic account handling functions:
@@ -31,7 +32,7 @@ AnyCategory = CategoryObject | ChildCategoryObject
 AnyAccount = ManualAccountObject | PlaidAccountObject
 
 # just raw dicts for now:
-YnabAccount = dict
+YnabAccount = dict[str, Any]
 
 LM_CACHE_FILE = "lm_cache.json"
 
@@ -63,30 +64,35 @@ def load_json(data_dir: Path, name: str) -> Any:
     """Load an export JSON file. Caller annotates the expected shape (list/dict)."""
     return json.loads((data_dir / f"{name}.json").read_text())
 
+class LMCache(BaseModel):
+    manual_accounts: list[ManualAccountObject] = Field(default_factory=list)
+    plaid_accounts:  list[PlaidAccountObject]  = Field(default_factory=list)
+    categories:      list[CategoryObject]      = Field(default_factory=list)
 
-def load_lm_cache(data_dir: Path) -> dict:
+def load_lm_cache(data_dir: Path) -> LMCache:
     path = data_dir / LM_CACHE_FILE
     if path.exists():
-        data: dict = json.loads(path.read_text())
-        return data
-    return {}
+        data: dict[str, Any] = json.loads(path.read_text())
+        return LMCache(**data)
+    return LMCache()
 
 
-def save_lm_cache(data_dir: Path, manual: list, plaid: list, cats_flat: list):
-    (data_dir / LM_CACHE_FILE).write_text(json.dumps({
-        "manual_accounts": manual,
-        "plaid_accounts":  plaid,
-        "categories":      cats_flat,
-    }, indent=2))
+def save_lm_cache(data_dir: Path,
+                  manual: list[ManualAccountObject],
+                  plaid: list[PlaidAccountObject],
+                  cats: list[CategoryObject]) -> None:
+    cache = LMCache(manual_accounts=manual, plaid_accounts=plaid, categories=cats)
+    (data_dir / LM_CACHE_FILE).write_text(cache.model_dump_json(indent=2))
 
 
-def patch_yaml_account(text: str, uuid: str, lm_type: str, lm_id, match_method) -> str:
+def patch_yaml_account(text: str, uuid: str, lm_type: str,
+                        lm_id: int | None, match_method: str | None) -> str:
     """Update lm_type/lm_id/match_method for one account entry, preserving comments."""
     lines = text.split("\n")
     out, i = [], 0
     while i < len(lines):
         line = lines[i]
-        if line.rstrip() == f'  "{uuid}":':
+        if re.match(rf'^  "?{re.escape(uuid)}"?:\s*$', line.rstrip()):
             out.append(line)
             i += 1
             while i < len(lines) and lines[i].startswith("    "):
@@ -106,11 +112,11 @@ def patch_yaml_account(text: str, uuid: str, lm_type: str, lm_id, match_method) 
     return "\n".join(out)
 
 
-def patch_yaml_scalar(text: str, uuid: str, lm_id) -> str:
-    """Update a scalar category/group mapping line: '  "uuid": value'."""
+def patch_yaml_scalar(text: str, uuid: str, lm_id: int | None) -> str:
+    """Update a scalar category/group mapping line: '  uuid: value'."""
     val = "null" if lm_id is None else str(lm_id)
     return re.sub(
-        rf'^(  "{re.escape(uuid)}":\s*)\S+',
+        rf'^(  "?{re.escape(uuid)}"?:\s*)\S+',
         rf"\g<1>{val}",
         text,
         flags=re.MULTILINE,
@@ -177,37 +183,33 @@ def score_account_match(ynab_acc: YnabAccount, lm_acc: AnyAccount) -> tuple[floa
     return score, f"name similarity {ns:.0%}"
 
 
-def _write_mapping_skeleton(path: Path, meta: dict, ynab_accounts: list,
-                             ynab_groups: list, ynab_cats_by_group: dict):
+def _write_mapping_skeleton(path: Path, meta: dict[str, Any],
+                             ynab_accounts: list[dict[str, Any]],
+                             ynab_groups: list[dict[str, Any]],
+                             ynab_cats_by_group: dict[str, list[dict[str, Any]]]) -> None:
     """Write a fresh mapping.yaml with all nulls (no heuristics applied)."""
-    lines = [
-        f"ynab_budget_id: \"{meta['budget_id']}\"",
-        f"ynab_budget_name: \"{meta['budget_name']}\"",
-        "",
-        "accounts:",
-    ]
-    for a in sorted(ynab_accounts, key=lambda x: (not x["on_budget"], x["name"])):
-        if a["deleted"]:
-            continue
-        lm_type = "plaid" if a.get("direct_import_linked") else "manual"
-        lines += [f"  \"{a['id']}\":", f"    lm_type: {lm_type}",
-                  "    lm_id: null", "    match_method: null", ""]
-    lines += ["category_groups:"]
-    for g in ynab_groups:
-        lines.append(f"  \"{g['id']}\": null")
-    lines += ["", "categories:"]
-    for g in ynab_groups:
-        for c in ynab_cats_by_group.get(g["id"], []):
-            lines.append(f"  \"{c['id']}\": null")
-    lines += ["", "lm_excluded:",
-              "  manual_accounts: []", "  plaid_accounts: []", "  categories: []", ""]
-    path.write_text("\n".join(lines))
+    data = MappingData(
+        ynab_budget_id=meta["budget_id"],
+        ynab_budget_name=meta["budget_name"],
+        accounts={
+            a["id"]: AccountMapping(lm_type="plaid" if a.get("direct_import_linked") else "manual")
+            for a in sorted(ynab_accounts, key=lambda x: (not x["on_budget"], x["name"]))
+            if not a["deleted"]
+        },
+        category_groups={g["id"]: None for g in ynab_groups},
+        categories={
+            c["id"]: None
+            for g in ynab_groups
+            for c in ynab_cats_by_group.get(g["id"], [])
+        },
+    )
+    Mapping(data).save(path.parent)
 
 
 
 # ── audit ─────────────────────────────────────────────────────────────────────
 
-def cmd_audit(data_dir: Path, client: LMClient):
+def cmd_audit(data_dir: Path, client: LMClient) -> None:
     """Strict YNAB-first audit: every LM entity must map to a YNAB entity."""
     mapping = Mapping.load(data_dir)
 
@@ -216,7 +218,7 @@ def cmd_audit(data_dir: Path, client: LMClient):
     lm_plaid  = client.get_plaid_accounts()
     lm_cats_raw = client.get_categories()
 
-    lm_cats_flat: list[CategoryObject | ChildCategoryObject] = []
+    lm_cats_flat: list[AnyCategory] = []
     for c in lm_cats_raw:
         lm_cats_flat.append(c)
         lm_cats_flat.extend(c.children or [])
@@ -270,10 +272,10 @@ def cmd_audit(data_dir: Path, client: LMClient):
 
     # ── plaid accounts ────────────────────────────────────────────────────────
     print("Checking plaid accounts...")
-    for a in lm_plaid:
-        lid = a.id
-        name = a.display_name or a.name
-        mask = a.mask
+    for pa in lm_plaid:
+        lid = pa.id
+        name = pa.display_name or pa.name
+        mask = pa.mask
 
         if mapping.is_excluded_plaid(lid):
             ok.append(f"  [excluded]  plaid account {lid} '{name}' mask={mask}")
@@ -291,10 +293,10 @@ def cmd_audit(data_dir: Path, client: LMClient):
 
     # ── categories ────────────────────────────────────────────────────────────
     print("Checking categories...")
-    for c in lm_cats_flat:
-        lid = c.id
-        name = c.name
-        is_group = c.is_group
+    for cat in lm_cats_flat:
+        lid = cat.id
+        name = cat.name
+        is_group = cat.is_group
 
         if mapping.is_excluded_category(lid):
             ok.append(f"  [excluded]  {'group' if is_group else 'category'} {lid} '{name}'")
@@ -363,12 +365,12 @@ def cmd_audit(data_dir: Path, client: LMClient):
 
 USE_COLOR = sys.stdout.isatty()
 
-def _c(code): return f"\033[{code}m" if USE_COLOR else ""
+def _c(code: int | str) -> str: return f"\033[{code}m" if USE_COLOR else ""
 RESET = _c(0); BOLD = _c(1); DIM = _c(2)
 GREEN = _c(32); YELLOW = _c(33); RED = _c(31); CYAN = _c(36)
 
 
-def _col(text: str, width: int, right=False) -> str:
+def _col(text: str, width: int, right: bool = False) -> str:
     import re
     from wcwidth import wcswidth
     stripped = re.sub(r"\033\[[0-9;]*m", "", text)
@@ -376,17 +378,17 @@ def _col(text: str, width: int, right=False) -> str:
     return (" " * pad + text) if right else (text + " " * pad)
 
 
-def cmd_show_mapping(data_dir: Path):
+def cmd_show_mapping(data_dir: Path) -> None:
     """Display the current mapping in a readable table (no API calls)."""
     mapping = Mapping.load(data_dir)
     cache = load_lm_cache(data_dir)
 
-    ynab_accounts: list[dict] = load_json(data_dir, "accounts")
-    ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
-    meta: dict = load_json(data_dir, "export_metadata")
+    ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
+    ynab_groups_raw: list[dict[str, Any]] = load_json(data_dir, "categories")
+    meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     ynab_groups = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
-    ynab_cats_by_group: dict[str, list[dict]] = {
+    ynab_cats_by_group: dict[str, list[dict[str, Any]]] = {
         g["id"]: [c for c in g.get("categories", []) if not c["deleted"] and not c["internal"]]
         for g in ynab_groups
     }
@@ -394,23 +396,29 @@ def cmd_show_mapping(data_dir: Path):
     raw = mapping.raw
     excl = raw.get("lm_excluded", {})
 
-    cache_manual = {a["id"]: a for a in cache.get("manual_accounts", [])}
-    cache_plaid  = {a["id"]: a for a in cache.get("plaid_accounts",  [])}
-    cache_cats   = {c["id"]: c for c in cache.get("categories",      [])}
+    cache_manual = {a.id: a for a in cache.manual_accounts}
+    cache_plaid  = {a.id: a for a in cache.plaid_accounts}
+    cache_cats: dict[int, AnyCategory] = {}
+    for _c_ in cache.categories:
+        cache_cats[_c_.id] = _c_
+        for ch in (_c_.children or []):
+            cache_cats[ch.id] = ch
 
-    def lm_acc_name(entry: dict) -> str:
+    def lm_acc_name(entry: dict[str, Any]) -> str:
         lm_id  = entry.get("lm_id")
         lm_typ = entry.get("lm_type")
         if lm_id is None:
             return RED + "(unmatched)" + RESET
         if lm_typ == "plaid":
-            a = cache_plaid.get(lm_id, {})
-            name = a.get("display_name") or a.get("name") or "?"
-            mask = f" ···{a['mask']}" if a.get("mask") else ""
+            a = cache_plaid.get(lm_id)
+            if a is None:
+                return "?"
+            name = a.display_name or a.name
+            mask = f" ···{a.mask}"
             return f"{name}{mask}"
         if lm_typ == "manual":
-            a = cache_manual.get(lm_id, {})
-            return a.get("name") or "?"
+            ma = cache_manual.get(lm_id)
+            return (ma.name if ma else None) or "?"
         return "?"
 
     # ── accounts ──────────────────────────────────────────────────────────────
@@ -423,7 +431,7 @@ def cmd_show_mapping(data_dir: Path):
 
     matched_acc = needs_acc = 0
 
-    def print_account_group(label: str, accounts: list[dict]):
+    def print_account_group(label: str, accounts: list[dict[str, Any]]) -> None:
         nonlocal matched_acc, needs_acc
         if not accounts:
             return
@@ -470,19 +478,19 @@ def cmd_show_mapping(data_dir: Path):
     excluded_manual = set(excl.get("manual_accounts", []))
     excluded_plaid  = set(excl.get("plaid_accounts",  []))
 
-    unmapped_manual = [a for a in cache.get("manual_accounts", [])
-                       if a["id"] not in referenced_manual and a["id"] not in excluded_manual]
-    unmapped_plaid  = [a for a in cache.get("plaid_accounts",  [])
-                       if a["id"] not in referenced_plaid  and a["id"] not in excluded_plaid]
+    unmapped_manual = [a for a in cache.manual_accounts
+                       if a.id not in referenced_manual and a.id not in excluded_manual]
+    unmapped_plaid  = [a for a in cache.plaid_accounts
+                       if a.id not in referenced_plaid  and a.id not in excluded_plaid]
 
     if unmapped_manual or unmapped_plaid:
         print(f"\n  {BOLD}{RED}Unmapped LM accounts — run fix-mapping{RESET}")
         for a in unmapped_manual:
-            print(f"  {RED}⚠ [manual] {a['id']:8}  {a['name']}{RESET}")
-        for a in unmapped_plaid:
-            name = a.get("display_name") or a.get("name", "?")
-            mask = f"  ···{a['mask']}" if a.get("mask") else ""
-            print(f"  {RED}⚠ [plaid]  {a['id']:8}  {name}{mask}{RESET}")
+            print(f"  {RED}⚠ [manual] {a.id:8}  {a.name}{RESET}")
+        for pa in unmapped_plaid:
+            name = pa.display_name or pa.name
+            mask = f"  ···{pa.mask}" if pa.mask else ""
+            print(f"  {RED}⚠ [plaid]  {pa.id:8}  {name}{mask}{RESET}")
 
     # ── categories ────────────────────────────────────────────────────────────
     groups_map = raw.get("category_groups", {})
@@ -503,8 +511,8 @@ def cmd_show_mapping(data_dir: Path):
             g_lm_name = RED + "(to create)" + RESET
             g_status  = YELLOW + "to create" + RESET
         else:
-            gc = cache_cats.get(lm_gid, {})
-            g_lm_name = GREEN + (gc.get("name") or str(lm_gid)) + RESET
+            gc = cache_cats.get(lm_gid)
+            g_lm_name = GREEN + ((gc.name if gc else None) or str(lm_gid)) + RESET
             g_status  = GREEN + "matched" + RESET
             matched_groups += 1
 
@@ -518,8 +526,8 @@ def cmd_show_mapping(data_dir: Path):
                 c_lm_name = RED + "(to create)" + RESET
                 c_status  = YELLOW + "to create" + RESET
             else:
-                cc = cache_cats.get(lm_cid, {})
-                c_lm_name = GREEN + (cc.get("name") or str(lm_cid)) + RESET
+                cc = cache_cats.get(lm_cid)
+                c_lm_name = GREEN + ((cc.name if cc else None) or str(lm_cid)) + RESET
                 c_status  = GREEN + "matched" + RESET
                 matched_cats += 1
             print(f"    {_col(c['name'], 34)}{_col(c_lm_name, 34)}{c_status}")
@@ -527,14 +535,14 @@ def cmd_show_mapping(data_dir: Path):
     # unmapped LM categories
     referenced_cats = {v for v in cats_map.values() if v} | {v for v in groups_map.values() if v}
     excluded_cats   = set(excl.get("categories", []))
-    unmapped_cats   = [c for c in cache.get("categories", [])
-                       if c["id"] not in referenced_cats and c["id"] not in excluded_cats]
+    unmapped_cats: list[AnyCategory] = [c for c in cache_cats.values()
+                                         if c.id not in referenced_cats and c.id not in excluded_cats]
 
     if unmapped_cats:
         print(f"\n  {BOLD}{RED}Unmapped LM categories — run fix-mapping{RESET}")
-        for c in unmapped_cats:
-            kind = "group" if c.get("is_group") else "cat  "
-            print(f"  {RED}⚠ [{kind}] {c['id']:8}  {c.get('name','?')}{RESET}")
+        for uc in unmapped_cats:
+            kind = "group" if uc.is_group else "cat  "
+            print(f"  {RED}⚠ [{kind}] {uc.id:8}  {uc.name or '?'}{RESET}")
 
     # ── summary ───────────────────────────────────────────────────────────────
     print(f"\n{BOLD}Summary{RESET}")
@@ -574,7 +582,7 @@ def _lm_acc_desc(a: AnyAccount, kind: str) -> str:
     return f"{a.name or '?'}  ({a.type or '?'}  bal={bal})"
 
 
-def cmd_fix_mapping(data_dir: Path, client: LMClient):
+def cmd_fix_mapping(data_dir: Path, client: LMClient) -> None:
     """Create mapping.yaml if missing, then interactively map unmatched LM entities to YNAB entities."""
     mapping_path = data_dir / MAPPING_FILE
 
@@ -588,14 +596,14 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
         lm_cats_flat.append(c)
         lm_cats_flat.extend(c.children or [])
 
-    save_lm_cache(data_dir, lm_manual, lm_plaid, lm_cats_flat)
+    save_lm_cache(data_dir, lm_manual, lm_plaid, lm_cats_raw)
 
-    ynab_accounts: list[dict[str, dict]] = load_json(data_dir, "accounts")
-    ynab_groups_raw: list[dict] = load_json(data_dir, "categories")
-    meta: dict = load_json(data_dir, "export_metadata")
+    ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
+    ynab_groups_raw: list[dict[str, Any]] = load_json(data_dir, "categories")
+    meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     ynab_groups_tmp = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
-    ynab_cats_by_group_tmp: dict[str, list[dict]] = {
+    ynab_cats_by_group_tmp: dict[str, list[dict[str, Any]]] = {
         g["id"]: [c for c in g.get("categories", []) if not c["deleted"] and not c["internal"]]
         for g in ynab_groups_tmp
     }
@@ -608,7 +616,7 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
 
     ynab_acc_by_id = {a["id"]: a for a in ynab_accounts}
     ynab_groups = [g for g in ynab_groups_raw if not g["deleted"] and not g["internal"]]
-    ynab_cats_flat: list[dict] = []
+    ynab_cats_flat: list[dict[str, Any]] = []
     for g in ynab_groups:
         for c in g.get("categories", []):
             if not c["deleted"] and not c["internal"]:
@@ -639,7 +647,7 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
     mapped_cat_ids      = {v for v in cats_section.values() if v} | {v for v in groups_section.values() if v}
 
     # YNAB candidates: those with lm_id still null (available to be claimed)
-    def ynab_acc_candidates(_lm_type: str) -> list[tuple[str, dict]]:
+    def ynab_acc_candidates(_lm_type: str) -> list[tuple[str, dict[str, Any]]]:
         return [
             (yid, ynab_acc_by_id[yid])
             for yid, info in accounts_section.items()
@@ -649,7 +657,7 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
             and yid in ynab_acc_by_id
         ]
 
-    def ynab_cat_candidates(is_group: bool) -> list[tuple[str, dict]]:
+    def ynab_cat_candidates(is_group: bool) -> list[tuple[str, dict[str, Any]]]:
         if is_group:
             return [(yid, ynab_group_by_id[yid]) for yid, v in groups_section.items()
                     if v is None and yid in ynab_group_by_id]
@@ -658,13 +666,13 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
 
     changed = False
 
-    def save():
+    def save() -> None:
         nonlocal text
         mapping_path.write_text(text)
         print(f"  → Saved {mapping_path}")
 
     def do_account_section(lm_items: Sequence[AnyAccount], lm_type: str, section_name: str,
-                            covered_ids: set, excluded_ids: set):
+                            covered_ids: set[int], excluded_ids: set[int]) -> None:
         nonlocal text, changed
         unresolved = [
             a for a in lm_items
@@ -738,7 +746,7 @@ def cmd_fix_mapping(data_dir: Path, client: LMClient):
                 else:
                     print(f"  Invalid — enter a number or s/q")
 
-    def do_category_section(lm_items: Sequence[AnyCategory], is_group: bool):
+    def do_category_section(lm_items: Sequence[AnyCategory], is_group: bool) -> None:
         nonlocal text, changed
         kind = "group" if is_group else "category"
         unresolved = [
@@ -846,15 +854,20 @@ _A_PLAID_RO      = "skip_plaid_ro"  # Plaid match found but read-only — skip
 _A_DELETED       = "skip_deleted"   # YNAB account is deleted
 
 
-def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
-                         lm_manual: list, lm_plaid: list) -> list:
+def _build_account_plan(ynab_accounts: list[dict[str, Any]], meta: dict[str, Any],
+                         sync: SyncState,
+                         lm_manual: list[ManualAccountObject],
+                         lm_plaid: list[PlaidAccountObject]) -> list[dict[str, Any]]:
     currency = meta["currency"].lower()
 
-    lm_manual_by_ext = {a["external_id"]: a for a in lm_manual if a.get("external_id")}
-    lm_plaid_by_norm = {normalize(a.get("display_name") or a.get("name", "")): a
-                        for a in lm_plaid}
+    lm_manual_by_ext: dict[str, ManualAccountObject] = {
+        a.external_id: a for a in lm_manual if a.external_id
+    }
+    lm_plaid_by_norm: dict[str, PlaidAccountObject] = {
+        normalize(a.display_name or a.name): a for a in lm_plaid
+    }
 
-    plan = []
+    plan: list[dict[str, Any]] = []
     for acc in sorted(ynab_accounts, key=lambda a: (not a["on_budget"], a["name"])):
         ynab_id = acc["id"]
 
@@ -873,21 +886,21 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
         if ynab_id in lm_manual_by_ext:
             lm_acc = lm_manual_by_ext[ynab_id]
             plan.append({"action": _A_RECOVER, "acc": acc, "lm_type": "manual",
-                         "lm_id": lm_acc["id"], "lm_name": lm_acc["name"]})
+                         "lm_id": lm_acc.id, "lm_name": lm_acc.name})
             continue
 
         # Bank-synced in YNAB: try to match an existing Plaid account in LM
         if acc.get("direct_import_linked"):
             match = lm_plaid_by_norm.get(normalize(acc["name"]))
             if match:
-                if match.get("allow_transaction_modification", True):
+                if match.allow_transaction_modifications:
                     plan.append({"action": _A_PLAID, "acc": acc,
-                                 "lm_id": match["id"],
-                                 "lm_name": match.get("display_name") or match.get("name")})
+                                 "lm_id": match.id,
+                                 "lm_name": match.display_name or match.name})
                 else:
                     plan.append({"action": _A_PLAID_RO, "acc": acc,
-                                 "lm_id": match["id"],
-                                 "lm_name": match.get("display_name") or match.get("name")})
+                                 "lm_id": match.id,
+                                 "lm_name": match.display_name or match.name})
                 continue
 
         # Create as manual account
@@ -898,13 +911,13 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
             # Fallback for backward compatibility
             lm_type, lm_subtype = lm_type_tuple, None
 
-        custom = {"ynab_type": acc.get("type"), "ynab_on_budget": acc.get("on_budget")}
+        custom: dict[str, Any] = {"ynab_type": acc.get("type"), "ynab_on_budget": acc.get("on_budget")}
         if acc.get("direct_import_linked"):
             custom["ynab_bank_synced"] = True  # was direct-import in YNAB, no Plaid match
         if acc.get("note"):
             custom["ynab_note"] = acc["note"]
 
-        payload: dict = {
+        payload: dict[str, Any] = {
             "name": acc["name"][:45],
             "type": lm_type,
             "balance": "0.0000",
@@ -925,7 +938,7 @@ def _build_account_plan(ynab_accounts: list, meta: dict, sync: SyncState,
     return plan
 
 
-def _print_account_plan(plan: list, apply: bool):
+def _print_account_plan(plan: list[dict[str, Any]], apply: bool) -> None:
     counts = {k: 0 for k in (_A_CREATE, _A_SYNCED, _A_RECOVER, _A_PLAID,
                                _A_PLAID_RO, _A_DELETED)}
     for item in plan:
@@ -950,7 +963,7 @@ def _print_account_plan(plan: list, apply: bool):
     on_budget  = [i for i in plan if i["action"] == _A_CREATE and i["acc"].get("on_budget")]
     off_budget = [i for i in plan if i["action"] == _A_CREATE and not i["acc"].get("on_budget")]
 
-    def _print_group(label: str, items: list):
+    def _print_group(label: str, items: list[dict[str, Any]]) -> None:
         if not items:
             return
         print(f"\n    {CYAN}{label}{RESET}")
@@ -986,9 +999,9 @@ def _print_account_plan(plan: list, apply: bool):
 
 
 def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
-                   meta: dict, apply: bool) -> int:
+                   meta: dict[str, Any], apply: bool) -> int:
     """Plan and optionally execute account sync. Returns count of changes made."""
-    ynab_accounts: list = load_json(data_dir, "accounts")
+    ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
 
     print("  Fetching Lunch Money accounts...")
     lm_manual = client.get_manual_accounts()
@@ -1039,8 +1052,8 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
 
 # ── import command ────────────────────────────────────────────────────────────
 
-def cmd_import(data_dir: Path, client: LMClient, apply: bool):
-    meta: dict = load_json(data_dir, "export_metadata")
+def cmd_import(data_dir: Path, client: LMClient, apply: bool) -> None:
+    meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     print("Fetching Lunch Money user info...")
     me = client.get_me()
@@ -1071,7 +1084,7 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool):
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Import YNAB data into Lunch Money.")
     parser.add_argument("--data", metavar="DIR", required=True,
                         help="Path to YNAB export directory (e.g. data/brl)")
