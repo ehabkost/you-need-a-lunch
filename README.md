@@ -51,3 +51,13 @@ Secrets are read exclusively from environment variables — no config files, no 
 | `LUNCHMONEY_API_TOKEN` | `lunchmoney/` |
 
 If a required variable is missing, the tool exits immediately with a clear error message naming it.
+
+Main entry points:
+
+```sh
+python ynab/export.py                  # dump the YNAB budget to data/<slug>/
+python lunchmoney/import.py import     # dry-run summary of what would be imported
+python lunchmoney/import.py import --apply   # actually write to Lunch Money
+```
+
+`lunchmoney/import.py` also has `show-mapping`, `audit`, and `fix-mapping` subcommands; see `--help` for details.
