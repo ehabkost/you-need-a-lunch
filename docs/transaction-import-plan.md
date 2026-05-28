@@ -181,3 +181,18 @@ One LM account will receive transactions from multiple YNAB budgets (e.g. CAD + 
   - Phase 1 Transactions: account/category lookups never fall back to "find by name in LM" — every reference must come from sync_state, and a missing entry is a hard error (see [[project_transaction_import_deps]]).
   - Re-runs: the create-from-scratch invariant only holds on the initial import; subsequent runs use sync_state for everything. Document this clearly so users don't expect the importer to reconcile against LM changes they made themselves (related to item 13).
   - Config implication: the per-pair config (item 16) should specify the *target LM account* (which will be created if absent) and the *category-group naming convention* (e.g. prefix categories with the budget name to disambiguate multi-budget imports into a single LM account). These can no longer rely on "the user has already set up the matching entities in LM".
+
+### 18. LM account-merging behaviour is unverified
+The post-import "sort out the mess" stage in [multi-currency-strategy.md](multi-currency-strategy.md) assumes the user can merge/restructure LM accounts after the import lands. Before relying on that workflow, we need to verify:
+  - Does LM support merging two manual accounts? Two Plaid accounts? Cross-type (manual ↔ Plaid)?
+  - What happens to `external_id`, `custom_metadata`, transaction history, category assignments, and `custom_metadata.ynab_id` markers on transactions when accounts merge?
+  - Does the surviving account's ID stay stable, or does merge produce a new ID? Either way, can the importer's `sync_state.json` recover from a post-merge state on the next run, or will mappings silently break?
+  - If LM's merge feature is missing or limited: a "merge helper" tool needs to be added to [future-tools.md](future-tools.md) and the importer's re-run logic needs a documented strategy for detecting post-merge state.
+
+### 19. LM multi-currency category-balance semantics are unverified
+Relevant to the multi-budget category-handling decision (item 17, last bullet) and tracked in detail in [multi-currency-strategy.md](multi-currency-strategy.md) Q2. We need to confirm:
+  - When transactions in two currencies share an LM category, does LM compute a per-currency total, a base-currency total via FX, or both?
+  - Are category budget amounts denominated in the LM account's base currency only, or per-currency?
+  - Practical limits (precision, FX rate source, historical FX) that would make multi-currency category totals unreliable.
+
+The user has indicated that BRL transactions are mostly historical and precise BRL category-balance tracking is not required, so a lossy outcome (e.g. don't budget against BRL-imported categories at all) is acceptable. The answer to this question selects between the per-budget-category-separation strategies in `multi-currency-strategy.md`.
