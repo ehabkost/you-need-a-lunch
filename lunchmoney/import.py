@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lm_api_types_generated import CategoryObject, ChildCategoryObject, ManualAccountObject, PlaidAccountObject, UpdateManualAccountRequestObject
+from lm_api_types_generated import CategoryObject, ChildCategoryObject, CreateCategoryRequestObject, ManualAccountObject, PlaidAccountObject, UpdateManualAccountRequestObject
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping, MappingData, AccountMapping
 from sync_state import SyncState
@@ -1188,9 +1188,285 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
     return changes
 
 
+# ── import: categories phase ──────────────────────────────────────────────────
+
+# YNAB system group names that have no LM equivalent and should be skipped.
+# Note: we match by name rather than the `internal` flag because `internal=True`
+# also appears on some legitimate user-created groups (YNAB quirk).
+_YNAB_SYSTEM_GROUPS = frozenset({
+    "Internal Master Category",
+    "Credit Card Payments",
+    "Hidden Categories",
+})
+
+# Action codes for the categories plan
+_CG_CREATE   = "create_group"
+_CG_SYNCED   = "already_synced_group"
+_CG_RECOVER  = "recover_group"
+_CG_DELETED  = "skip_deleted_group"
+_CG_SYSTEM   = "skip_system_group"
+_CG_UNMAPPED = "unmapped_group"
+
+_CC_CREATE   = "create_cat"
+_CC_SYNCED   = "already_synced_cat"
+_CC_RECOVER  = "recover_cat"
+_CC_DELETED  = "skip_deleted_cat"
+_CC_INTERNAL = "skip_internal_cat"
+_CC_INFLOW   = "map_inflow"
+_CC_SYSTEM   = "skip_system_cat"    # cat inside a system group
+_CC_UNMAPPED = "unmapped_cat"
+
+
+def _build_category_plan(
+    ynab_groups_raw: list[dict[str, Any]],
+    mapping: Mapping,
+    sync: SyncState,
+    mapping_groups: dict[str, Any],
+    mapping_cats: dict[str, Any],
+) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+
+    for group in ynab_groups_raw:
+        gid   = group["id"]
+        gname = group["name"]
+
+        if group.get("deleted"):
+            plan.append({"action": _CG_DELETED, "name": gname, "ynab_id": gid})
+            for cat in group.get("categories", []):
+                plan.append({"action": _CC_DELETED, "name": cat["name"],
+                              "ynab_id": cat["id"], "group_name": gname})
+            continue
+
+        if gname in _YNAB_SYSTEM_GROUPS:
+            plan.append({"action": _CG_SYSTEM, "name": gname, "ynab_id": gid})
+            for cat in group.get("categories", []):
+                if not cat.get("deleted"):
+                    if cat["name"] == "Inflow: Ready to Assign":
+                        plan.append({"action": _CC_INFLOW, "name": cat["name"],
+                                     "ynab_id": cat["id"], "group_name": gname})
+                    else:
+                        plan.append({"action": _CC_SYSTEM, "name": cat["name"],
+                                     "ynab_id": cat["id"], "group_name": gname})
+                else:
+                    plan.append({"action": _CC_DELETED, "name": cat["name"],
+                                 "ynab_id": cat["id"], "group_name": gname})
+            continue
+
+        # Plan the group itself
+        existing_g = sync.category_group(gid)
+        if existing_g:
+            plan.append({"action": _CG_SYNCED, "name": gname, "ynab_id": gid,
+                         "lm_id": existing_g.lm_id})
+        elif gid in mapping_groups:
+            mapped_lm_id = mapping_groups[gid]
+            if mapped_lm_id is not None:
+                plan.append({"action": _CG_RECOVER, "name": gname, "ynab_id": gid,
+                             "lm_id": mapped_lm_id})
+            else:
+                plan.append({"action": _CG_CREATE, "name": gname, "ynab_id": gid})
+        else:
+            plan.append({"action": _CG_UNMAPPED, "name": gname, "ynab_id": gid})
+
+        # Plan the categories within this group
+        for cat in group.get("categories", []):
+            cid   = cat["id"]
+            cname = cat["name"]
+
+            if cat.get("deleted"):
+                plan.append({"action": _CC_DELETED, "name": cname, "ynab_id": cid,
+                             "group_name": gname})
+                continue
+
+            if cat.get("internal"):
+                plan.append({"action": _CC_INTERNAL, "name": cname, "ynab_id": cid,
+                             "group_name": gname})
+                continue
+
+            existing_c = sync.category(cid)
+            if existing_c:
+                plan.append({"action": _CC_SYNCED, "name": cname, "ynab_id": cid,
+                             "lm_id": existing_c.lm_id, "group_name": gname})
+            elif cid in mapping_cats:
+                mapped_lm_id = mapping_cats[cid]
+                if mapped_lm_id is not None:
+                    plan.append({"action": _CC_RECOVER, "name": cname, "ynab_id": cid,
+                                 "lm_id": mapped_lm_id, "group_name": gname,
+                                 "ynab_group_id": gid})
+                else:
+                    plan.append({"action": _CC_CREATE, "name": cname, "ynab_id": cid,
+                                 "group_name": gname, "ynab_group_id": gid,
+                                 "archived": bool(cat.get("hidden"))})
+            else:
+                plan.append({"action": _CC_UNMAPPED, "name": cname, "ynab_id": cid,
+                             "group_name": gname})
+
+    return plan
+
+
+def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
+    def count(action: str) -> int:
+        return sum(1 for i in plan if i["action"] == action)
+
+    verb = "Will" if apply else "Would"
+    n_create_g   = count(_CG_CREATE)
+    n_create_c   = count(_CC_CREATE)
+    n_recover_g  = count(_CG_RECOVER)
+    n_recover_c  = count(_CC_RECOVER)
+    n_synced_g   = count(_CG_SYNCED)
+    n_synced_c   = count(_CC_SYNCED)
+    n_unmapped_g = count(_CG_UNMAPPED)
+    n_unmapped_c = count(_CC_UNMAPPED)
+    n_inflow     = count(_CC_INFLOW)
+
+    print(f"\n  {verb} create  {n_create_g:3} category group(s)")
+    print(f"  {verb} create  {n_create_c:3} categor(y/ies)")
+    if n_recover_g or n_recover_c:
+        print(f"  {verb} recover {n_recover_g:3} group(s) into sync state")
+        print(f"  {verb} recover {n_recover_c:3} categor(y/ies) into sync state")
+    if n_synced_g or n_synced_c:
+        print(f"  Skip     {n_synced_g:3} already-synced group(s)")
+        print(f"  Skip     {n_synced_c:3} already-synced categor(y/ies)")
+    if n_inflow:
+        print(f"  {verb} map     {n_inflow:3} 'Inflow: Ready to Assign' → LM income category")
+    if n_unmapped_g:
+        print(f"\n  {YELLOW}Warning: {n_unmapped_g} group(s) not in mapping.yaml — run fix-mapping{RESET}")
+        for item in (i for i in plan if i["action"] == _CG_UNMAPPED):
+            print(f"    {item['name']}")
+    if n_unmapped_c:
+        print(f"\n  {YELLOW}Warning: {n_unmapped_c} categor(y/ies) not in mapping.yaml — run fix-mapping{RESET}")
+        for item in (i for i in plan if i["action"] == _CC_UNMAPPED):
+            print(f"    {item['group_name']} / {item['name']}")
+
+    if n_create_g == 0 and n_create_c == 0 and n_recover_g == 0 and n_recover_c == 0 and n_inflow == 0:
+        return
+
+    if n_create_g:
+        print(f"\n    {CYAN}Groups to create{RESET}")
+        for item in (i for i in plan if i["action"] == _CG_CREATE):
+            print(f"      {item['name']}")
+
+    if n_create_c:
+        print(f"\n    {CYAN}Categories to create{RESET}")
+        cur_group = None
+        for item in (i for i in plan if i["action"] == _CC_CREATE):
+            if item["group_name"] != cur_group:
+                cur_group = item["group_name"]
+                print(f"      {BOLD}{cur_group}{RESET}")
+            flags = "  [archived]" if item.get("archived") else ""
+            print(f"        {item['name']}{flags}")
+
+
+def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
+                     mapping: Mapping, apply: bool,
+                     confirm_each: bool = False) -> int:
+    """Plan and optionally execute category + category-group sync. Returns count of changes."""
+    ynab_groups_raw: list[dict[str, Any]] = load_json(data_dir, "categories")
+
+    raw = mapping.raw
+    mapping_groups: dict[str, Any] = raw.get("category_groups", {})
+    mapping_cats:   dict[str, Any] = raw.get("categories", {})
+
+    plan = _build_category_plan(ynab_groups_raw, mapping, sync, mapping_groups, mapping_cats)
+    _print_category_plan(plan, apply)
+
+    actionable = [i for i in plan
+                  if i["action"] in (_CG_CREATE, _CG_RECOVER, _CC_CREATE, _CC_RECOVER, _CC_INFLOW)]
+    if not actionable:
+        print(f"\n  {GREEN}Nothing to do.{RESET}")
+        return 0
+
+    if not apply:
+        print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
+        return 0
+
+    # Fetch current LM categories for the inflow mapping
+    lm_cats = client.get_categories()
+    lm_income_cats = [c for c in lm_cats if getattr(c, "is_income", False)]
+
+    print()
+    changes = 0
+
+    # Process groups first so their LM IDs are available for category creation
+    for item in plan:
+        if item["action"] not in (_CG_CREATE, _CG_RECOVER):
+            continue
+        if confirm_each:
+            resp = input(f"  Apply group '{item['name']}' [{item['action']}]? [y/N] ").strip().lower()
+            if resp != "y":
+                print(f"  {DIM}Skipped.{RESET}")
+                continue
+
+        if item["action"] == _CG_CREATE:
+            result = client.create_category(CreateCategoryRequestObject(
+                name=item["name"],
+                is_group=True,
+                custom_metadata={"ynab_id": item["ynab_id"]},
+            ))
+            sync.set_category_group(item["ynab_id"], lm_id=result.id, lm_name=result.name)
+            sync.save(sync_dir)
+            print(f"  {GREEN}✓{RESET} Created group  '{item['name']}'  → LM {result.id}")
+            changes += 1
+
+        elif item["action"] == _CG_RECOVER:
+            sync.set_category_group(item["ynab_id"], lm_id=item["lm_id"], lm_name=item["name"])
+            sync.save(sync_dir)
+            print(f"  {GREEN}✓{RESET} Recovered group '{item['name']}'  → LM {item['lm_id']}")
+            changes += 1
+
+    # Now process categories
+    for item in plan:
+        if item["action"] not in (_CC_CREATE, _CC_RECOVER, _CC_INFLOW):
+            continue
+        if confirm_each:
+            resp = input(f"  Apply cat '{item['name']}' [{item['action']}]? [y/N] ").strip().lower()
+            if resp != "y":
+                print(f"  {DIM}Skipped.{RESET}")
+                continue
+
+        if item["action"] == _CC_INFLOW:
+            if lm_income_cats:
+                ic = lm_income_cats[0]
+                lm_id   = ic.id
+                lm_name = ic.name
+            else:
+                print(f"  {YELLOW}⚠{RESET}  No income category found in LM — skipping 'Inflow: Ready to Assign' mapping")
+                continue
+            sync.set_category(item["ynab_id"], lm_id=lm_id, lm_name=lm_name)
+            sync.save(sync_dir)
+            print(f"  {GREEN}✓{RESET} Mapped  'Inflow: Ready to Assign'  → LM income '{lm_name}' ({lm_id})")
+            changes += 1
+
+        elif item["action"] == _CC_RECOVER:
+            lm_group_id = sync.lm_category_group_id(item["ynab_group_id"])
+            sync.set_category(item["ynab_id"], lm_id=item["lm_id"], lm_name=item["name"],
+                               lm_group_id=lm_group_id)
+            sync.save(sync_dir)
+            print(f"  {GREEN}✓{RESET} Recovered cat  '{item['name']}'  → LM {item['lm_id']}")
+            changes += 1
+
+        elif item["action"] == _CC_CREATE:
+            lm_group_id = sync.lm_category_group_id(item["ynab_group_id"])
+            if lm_group_id is None:
+                print(f"  {YELLOW}⚠{RESET}  Skipping '{item['name']}' — parent group not yet in sync state")
+                continue
+            result = client.create_category(CreateCategoryRequestObject(
+                name=item["name"],
+                group_id=lm_group_id,
+                archived=item.get("archived", False),
+                custom_metadata={"ynab_id": item["ynab_id"]},
+            ))
+            sync.set_category(item["ynab_id"], lm_id=result.id, lm_name=result.name,
+                               lm_group_id=lm_group_id)
+            sync.save(sync_dir)
+            print(f"  {GREEN}✓{RESET} Created cat    '{item['name']}'  → LM {result.id}")
+            changes += 1
+
+    return changes
+
+
 # ── import command ────────────────────────────────────────────────────────────
 
-VALID_ENTITIES = {"accounts"}
+VALID_ENTITIES = {"accounts", "categories"}
 
 
 def cmd_import(data_dir: Path, client: LMClient, apply: bool,
@@ -1222,7 +1498,13 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
         phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
                        update_fields=update_fields, confirm_each=confirm_each)
 
-    # Future phases (categories, transactions) go here
+    if all_entities or "categories" in entities:
+        print(BOLD + "\n── Categories ──" + RESET)
+        mapping = Mapping.load(data_dir)
+        phase_categories(data_dir, client, sync, sync_dir, mapping, apply,
+                         confirm_each=confirm_each)
+
+    # Future phases (transactions) go here
     # NOTE: transaction import requires all accounts and categories to be
     # present in LM first. Before importing transactions, a status check is
     # needed to verify that every YNAB account and category referenced by
