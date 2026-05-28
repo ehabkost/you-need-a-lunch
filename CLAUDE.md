@@ -42,6 +42,18 @@ If a required variable is missing, the tool must exit immediately with a clear e
 - **YNAB**: Bearer token via `Authorization: Bearer TOKEN`. Rate limit: 200 requests/hour per token.
 - **Lunch Money**: Bearer token via `Authorization: Bearer TOKEN`. Base URL: `https://api.lunchmoney.dev/v2`. Mock server for testing: `https://mock.lunchmoney.dev/v2`.
 
+## Lunch Money Support Knowledge Base
+
+An MCP server for the LM support docs is configured at user scope (`knowledge-base`). Use it to look up LM behaviour, feature semantics, and how-to questions:
+
+- Tool: `mcp__knowledge-base__searchDocumentation` — search by keyword or question
+- Tool: `mcp__knowledge-base__getPage` — fetch a full page by URL
+
+Key pages relevant to this project:
+- `https://support.lunchmoney.app/guides/migrating-from-ynab` — YNAB→LM migration guide
+- `https://support.lunchmoney.app/finances/budget` — full budgeting feature reference
+- `https://support.lunchmoney.app/guides/budgeting/step-2-setting-up-your-budget` — rollover options, income settings, budget periods
+
 ## API Reference
 
 See **[docs/api-reference.md](docs/api-reference.md)** for details on YNAB and Lunch Money v2 APIs, including:
