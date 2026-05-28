@@ -110,3 +110,66 @@ Defensive check: if any transaction has `category_group_name == 'Credit Card Pay
 - **Foreign-currency CCs**: the account-exclusion rules (multi-budget.md) handle this at the account level. Ensure transfer-skip logic checks exclusion on *both* legs.
 - **Balance adjustments**: grep for `payee LIKE '%Balance Adjustment%'` to catch both YNAB variants.
 - **CC interest charges**: usually manual expenses with a real category. No special handling; flag in dry-run so user can verify reconciliation.
+
+---
+
+## Gaps and Open Questions
+
+This section captures known weaknesses, missing definitions, and incorrect claims in the rest of this document. Each item is to be addressed in a follow-up revision of the plan; do not treat the sections above as final until these are resolved.
+
+### 1. "Deferred Income" semantics are undefined
+Case 9 in the decision table defers to the user, but the doc never defines what YNAB's "Deferred Income SubCategory" actually represents (income earned in one month but intended for a future month's budget), when YNAB auto-creates it vs. when the user does, or whether it can carry a non-zero balance across the cutoff date. Need to research the YNAB behaviour and document a canonical mapping recommendation before asking the user to choose.
+
+### 2. CC-payment-category absence must be **asserted**, not assumed
+Case 10 and the "Defensive check" in the CC section both say "should not occur" / "log a warning" — too soft. Implementation must pre-flight scan the entire YNAB export and **abort with a clear error** if any transaction carries `category_group_name == 'Credit Card Payments'`. Soft warnings hide reconciliation-breaking data.
+
+### 3. Concrete fallback if the CC-payment-category assumption fails
+If a real export does contain CC-payment-categorised transactions, the doc has no plan. Options to evaluate:
+  - (a) Treat as a transfer from the budget category to the CC account (closest to YNAB's intent).
+  - (b) Import as uncategorised + flag for manual review.
+  - (c) Abort and require the user to fix the source data in YNAB.
+Pick one as default, document why, and surface the others as escape hatches in config.
+
+### 4. Transfer-leg metadata merge rules are missing
+The pairing strategy covers `ynab_id` / `ynab_paired_id` but is silent on per-leg metadata: memo/notes, flags, cleared status, approved status, original payee strings. Both YNAB legs can carry different values; LM stores one transfer. Need explicit precedence rules (e.g. outflow side wins; concatenate conflicting memos; preserve both flag colors in `custom_metadata`).
+
+### 5. In-budget vs. off-budget account handling is unspecified
+YNAB distinguishes on-budget from off-budget ("Tracking") accounts; transactions on tracking accounts don't affect category balances. LM's equivalent (excluding accounts from budget calculations) needs to be set per account, and transactions on tracking accounts must not be assigned categories that would distort LM's category totals. The plan currently treats all accounts identically.
+
+### 6. No method for verifying category balances match post-import
+Account balance reconciliation is documented (balance-reconciliation.md) but there's no equivalent for category balances. Need: a reconciliation pass that sums imported transactions per LM category and compares against YNAB's category activity for the same date range, plus a documented tolerance and how to surface discrepancies.
+
+### 7. Zero-based budgeting reproduction is unaddressed
+YNAB enforces every-dollar-assigned; LM does not by default. The plan doesn't describe how transaction-level metadata (and the eventual Phase 2 budget assignments) will reproduce or approximate zero-based behaviour in LM. Without this, category balances will diverge even when transactions are imported correctly.
+
+### 8. User opt-out for zero-based budgeting
+Some users migrate to LM specifically to escape zero-based budgeting. There should be a config option to suppress zero-based reconstruction (skip Phase 2 budget assignments, don't synthesize per-category opening entries, etc.). This needs to be a first-class choice, not an undocumented side effect.
+
+### 9. Category balance reconstruction under partial import (`--since`)
+Account balances are repaired via opening-balance transactions, but categories have no "opening balance" concept in YNAB. When history before the cutoff is excluded, category balances cannot be reconstructed the same way. Options to evaluate: synthesize per-category opening entries, accept lost pre-cutoff history, or refuse partial imports when zero-based mode is on. Pick one and document tradeoffs.
+
+### 10. Late-arriving (earlier) transactions break opening balances
+If a user runs `--since 1y` and later backfills older history, the synthesised opening-balance transactions will double-count. Need: a documented backfill procedure, a `sync_state` field tracking the current cutoff date, and detection logic that adjusts or removes opening-balance entries when an earlier cutoff is requested.
+
+### 11. Monthly carryover behaviour must be reconciled
+YNAB carries unspent / overspent category balances forward according to per-category rules (cash vs. credit, with/without "overspending handling"); LM has different semantics. Need to document YNAB's carryover rules per category type, the equivalent LM settings, and how the importer configures LM to match. Without this, balances drift month over month even when individual transactions are correct.
+
+### 12. Cross-currency transfer edge case is **wrong** and must be removed
+Edge case #3 claims YNAB stores cross-currency transfers as two transactions with different amounts. **YNAB has no cross-currency transfer support at all** — every transfer is single-currency by definition. Cross-currency movement between budgets is represented as two unrelated transactions in two separate YNAB budgets, which is out of scope for a single-budget importer and is already handled at the account-exclusion level (see multi-budget.md). Delete the edge case; do not introduce `ynab_cross_currency_transfer` metadata.
+
+### 13. Re-sync after the user has been actively using LM (deferred)
+If the user merges LM accounts, moves transactions between accounts, or splits/merges categories after the initial import, the sync_state mapping goes stale and re-runs will misbehave. Marked as a **future feature, not v1**. The plan should explicitly state that re-running the importer against a "live" LM account isn't supported in the initial release, and list the known failure modes for the future implementer.
+
+### 14. No CLI knobs for behaviour — config file only
+The current "Config Knobs" section uses `--map-uncategorized-to`, `--opening-balance-category`, `--deferred-income-as` flags. Move all behaviour configuration into a config file (TOML or YAML). The CLI should only take a path to the config file plus operational flags (`--dry-run`, `--since`, `--apply`, etc.). Rationale: these decisions are per-import-pair, repeated across runs, and belong in version-controllable state — not in shell history.
+
+### 15. Debt accounts have unreconcilable balances without a synthetic interest entry
+Per [mortgage-debt-tracking.md](mortgage-debt-tracking.md), YNAB debt accounts (mortgage, auto loan, line of credit) embed accrued interest into the account `balance` with **no corresponding transactions**. The transaction-import plan currently has no special handling for this: a transaction-by-transaction import of a debt account will leave its LM balance short by the accumulated interest. The plan needs to specify:
+  - Detection: identify YNAB accounts of debt type (or with non-empty `debt_interest_rates`).
+  - Reconciliation: after importing transactions, compute `expected_balance − sum(imported_txns) − opening_balance` and, if non-zero, insert a synthetic "Accrued Interest" adjustment transaction dated at the export-as-of date (or import time). Tag it with `custom_metadata.ynab_synthetic_interest_adjustment=true` so re-runs can find and replace it.
+  - Re-run behaviour: if a later run detects a different interest gap, **update** the existing synthetic transaction rather than appending a new one. (The opening-balance adjustment mechanism from item 10 is the natural pattern to mirror.)
+  - Metadata preservation: store `debt_interest_rates`, `debt_minimum_payments`, `debt_escrow_amounts`, and any `debt_transaction_type='balanceAdjustment'` markers on the LM account `custom_metadata`. These do not affect transaction logic but are needed for audit and future tooling.
+  - Edge cases: variable-rate LOCs (rate dictionary changes mid-cutoff), accounts with payments before the `--since` cutoff (the synthetic adjustment must absorb pre-cutoff interest *and* pre-cutoff principal alongside the opening balance — work out the math and document it), and YNAB's own `balanceAdjustment` debt-transaction-type entries (import as plain transactions, but flag them so the synthetic adjustment doesn't double-count).
+
+### 16. Config file must support multiple import pairs
+One LM account will receive transactions from multiple YNAB budgets (e.g. CAD + BRL). The config schema must enumerate `(ynab_budget_id, lm_account_id-or-mapping-rules, per-pair-knob-overrides)` tuples, not a single global set of values. Each pair owns its own opening-balance category, uncategorised fallback, deferred-income policy, account-exclusion list, and zero-based mode flag. Cross-pair invariants (e.g. don't double-import a transaction that appears in two exports) need their own section.
