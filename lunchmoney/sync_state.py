@@ -82,6 +82,10 @@ class SyncStateData(BaseModel):
     # LM-native categories with no YNAB equivalent (keyed by role name)
     # Keys: "payment_transfer", "tracking_off_budget"
     special_categories: dict[str, int] = Field(default_factory=dict)
+    # YNAB UUIDs of internal system categories (keyed by role name).
+    # Used by Phase 1 to distinguish intentionally-unmapped categories from mapping errors.
+    # Keys: "inflow", "uncategorized"
+    ynab_internal_cats: dict[str, str] = Field(default_factory=dict)
 
 
 class SyncState:
@@ -151,6 +155,14 @@ class SyncState:
 
     def set_special_cat(self, key: str, lm_id: int) -> None:
         self._d.special_categories[key] = lm_id
+
+    # ── YNAB internal system category UUIDs ──────────────────────────────────
+
+    def ynab_internal_cat(self, key: str) -> Optional[str]:
+        return self._d.ynab_internal_cats.get(key)
+
+    def set_ynab_internal_cat(self, key: str, ynab_id: str) -> None:
+        self._d.ynab_internal_cats[key] = ynab_id
 
     # ── lookups ───────────────────────────────────────────────────────────────
 

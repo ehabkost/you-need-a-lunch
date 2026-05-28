@@ -1142,7 +1142,7 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
 
     if not apply:
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
-        return 0
+        return len(actionable)
 
     print()
     changes = 0
@@ -1193,13 +1193,11 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
 # Action codes for the categories plan
 _CG_CREATE   = "create_group"
 _CG_SYNCED   = "already_synced_group"
-_CG_RECOVER  = "recover_group"      # found in LM by custom_metadata.ynab_id
 _CG_DELETED  = "skip_deleted_group"
 _CG_SYSTEM   = "skip_system_group"  # group has no importable (non-internal, non-deleted) cats
 
 _CC_CREATE   = "create_cat"
 _CC_SYNCED   = "already_synced_cat"
-_CC_RECOVER  = "recover_cat"        # found in LM by custom_metadata.ynab_id
 _CC_DELETED  = "skip_deleted_cat"
 _CC_INTERNAL = "skip_internal_cat"  # internal=true cat inside an otherwise importable group
 
@@ -1208,12 +1206,20 @@ _SC_CREATE  = "create_special"
 _SC_SYNCED  = "already_synced_special"
 _SC_RECOVER = "recover_special"     # found in LM, not yet in sync_state
 
+# YNAB internal categories that are intentionally NOT mapped to any LM category.
+# Phase 1 uses these UUIDs to distinguish expected None from a missing import.
+YNAB_UNMAPPED_INTERNAL_CATS: dict[str, str] = {
+    "Uncategorized": "uncategorized",
+}
+
+# YNAB internal categories that should be promoted to regular LM categories
+# despite being internal=True. Each entry is (ynab_name, lm_create_flags).
+YNAB_PROMOTED_INTERNAL_CATS: list[tuple[str, dict]] = [
+    ("Inflow: Ready to Assign", {"is_income": True}),
+]
+
 # Keys and properties for special LM categories with no YNAB equivalent.
 SPECIAL_LM_CATS: dict[str, dict] = {
-    "income": {
-        "name": "Income",
-        "is_income": True,
-    },
     "payment_transfer": {
         "name": "Payment, Transfer",
         "exclude_from_budget": True,
@@ -1249,13 +1255,40 @@ def _build_special_cat_plan(
     return plan
 
 
+def _lm_name_conflicts(ynab_groups_raw: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """Return set of (cat_name, group_name) pairs whose name conflicts in LM's global namespace.
+
+    LM requires all category and group names to be globally unique. YNAB allows the
+    same name to appear across groups or as both a category and a group name.
+    Conflicting categories will be renamed to "<name> (<group>)" at import time.
+    """
+    active_groups = [g for g in ynab_groups_raw
+                     if not g.get("deleted") and not g.get("internal")]
+    group_names = {g["name"] for g in active_groups}
+
+    # Count how many active groups contain each cat name
+    name_to_groups: dict[str, list[str]] = {}
+    for g in active_groups:
+        gname = g["name"]
+        for c in g.get("categories", []):
+            if c.get("deleted") or c.get("internal"):
+                continue
+            name_to_groups.setdefault(c["name"], []).append(gname)
+
+    conflicts: set[tuple[str, str]] = set()
+    for cname, groups in name_to_groups.items():
+        if cname in group_names or len(groups) > 1:
+            for gname in groups:
+                conflicts.add((cname, gname))
+    return conflicts
+
+
 def _build_category_plan(
     ynab_groups_raw: list[dict[str, Any]],
     sync: SyncState,
-    lm_groups_by_ynab_id: dict[str, CategoryObject],
-    lm_cats_by_ynab_id: dict[str, Any],
 ) -> list[dict[str, Any]]:
     plan: list[dict[str, Any]] = []
+    conflicts = _lm_name_conflicts(ynab_groups_raw)
 
     for group in ynab_groups_raw:
         gid   = group["id"]
@@ -1268,28 +1301,31 @@ def _build_category_plan(
                              "ynab_id": cat["id"], "group_name": gname})
             continue
 
-        # Skip groups that have no importable categories (non-internal, non-deleted).
-        # This catches pure-system groups (e.g. "Internal Master Category") without
-        # hardcoding names — see docs/ynab-quirks.md for why we can't use group.internal.
+        # Importable = non-deleted AND (non-internal OR promoted).
+        # Promoted internal cats (e.g. "Inflow: Ready to Assign") get an LM mapping
+        # even though their group is skipped. See docs/ynab-quirks.md.
+        promoted = {name: flags for name, flags in YNAB_PROMOTED_INTERNAL_CATS}
         importable_cats = [c for c in group.get("categories", [])
-                           if not c.get("deleted") and not c.get("internal")]
-        if not importable_cats:
+                           if not c.get("deleted") and
+                           (not c.get("internal") or c["name"] in promoted)]
+
+        # A group is system-only if it has no non-internal importable cats.
+        # Promoted cats still get category entries below; the group itself is skipped.
+        group_is_system = all(c.get("internal") for c in importable_cats)
+        if group_is_system and not importable_cats:
             plan.append({"action": _CG_SYSTEM, "name": gname, "ynab_id": gid})
             continue
 
-        # Plan the group itself
-        existing_g = sync.category_group(gid)
-        if existing_g:
-            plan.append({"action": _CG_SYNCED, "name": gname, "ynab_id": gid,
-                         "lm_id": existing_g.lm_id})
-        elif gid in lm_groups_by_ynab_id:
-            lm_g = lm_groups_by_ynab_id[gid]
-            plan.append({"action": _CG_RECOVER, "name": gname, "ynab_id": gid,
-                         "lm_id": lm_g.id, "lm_name": lm_g.name})
+        if group_is_system:
+            plan.append({"action": _CG_SYSTEM, "name": gname, "ynab_id": gid})
         else:
-            plan.append({"action": _CG_CREATE, "name": gname, "ynab_id": gid})
+            existing_g = sync.category_group(gid)
+            if existing_g:
+                plan.append({"action": _CG_SYNCED, "name": gname, "ynab_id": gid,
+                             "lm_id": existing_g.lm_id})
+            else:
+                plan.append({"action": _CG_CREATE, "name": gname, "ynab_id": gid})
 
-        # Plan the categories within this group
         for cat in group.get("categories", []):
             cid   = cat["id"]
             cname = cat["name"]
@@ -1299,24 +1335,29 @@ def _build_category_plan(
                              "group_name": gname})
                 continue
 
-            if cat.get("internal"):
+            extra_flags = promoted.get(cname) if cat.get("internal") else None
+            if cat.get("internal") and extra_flags is None:
                 plan.append({"action": _CC_INTERNAL, "name": cname, "ynab_id": cid,
                              "group_name": gname})
                 continue
 
+            # Promoted internal cats have no LM parent group; regular cats do.
+            cat_group_id = None if cat.get("internal") else gid
+
+            lm_name = (f"{cname} ({gname})" if (cname, gname) in conflicts
+                       else cname)
+
             existing_c = sync.category(cid)
             if existing_c:
-                plan.append({"action": _CC_SYNCED, "name": cname, "ynab_id": cid,
-                             "lm_id": existing_c.lm_id, "group_name": gname})
-            elif cid in lm_cats_by_ynab_id:
-                lm_c = lm_cats_by_ynab_id[cid]
-                plan.append({"action": _CC_RECOVER, "name": cname, "ynab_id": cid,
-                             "lm_id": lm_c.id, "lm_name": lm_c.name,
-                             "group_name": gname, "ynab_group_id": gid})
+                plan.append({"action": _CC_SYNCED, "name": cname, "lm_name": lm_name,
+                             "ynab_id": cid, "lm_id": existing_c.lm_id,
+                             "group_name": gname})
             else:
-                plan.append({"action": _CC_CREATE, "name": cname, "ynab_id": cid,
-                             "group_name": gname, "ynab_group_id": gid,
-                             "archived": bool(cat.get("hidden"))})
+                plan.append({"action": _CC_CREATE, "name": cname, "lm_name": lm_name,
+                             "ynab_id": cid, "group_name": gname,
+                             "ynab_group_id": cat_group_id,
+                             "archived": bool(cat.get("hidden")),
+                             **(extra_flags or {})})
 
     return plan
 
@@ -1328,8 +1369,6 @@ def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
     verb = "Will" if apply else "Would"
     n_create_g  = count(_CG_CREATE)
     n_create_c  = count(_CC_CREATE)
-    n_recover_g = count(_CG_RECOVER)
-    n_recover_c = count(_CC_RECOVER)
     n_synced_g  = count(_CG_SYNCED)
     n_synced_c  = count(_CC_SYNCED)
     n_sc_create  = count(_SC_CREATE)
@@ -1338,21 +1377,17 @@ def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
 
     print(f"\n  {verb} create  {n_create_g:3} category group(s)")
     print(f"  {verb} create  {n_create_c:3} categor(y/ies)")
-    if n_recover_g or n_recover_c:
-        print(f"  {verb} recover {n_recover_g:3} group(s) into sync state")
-        print(f"  {verb} recover {n_recover_c:3} categor(y/ies) into sync state")
     if n_synced_g or n_synced_c:
         print(f"  Skip     {n_synced_g:3} already-synced group(s)")
         print(f"  Skip     {n_synced_c:3} already-synced categor(y/ies)")
     if n_sc_create:
-        print(f"  {verb} create  {n_sc_create:3} special LM categor(y/ies) (income/transfer/tracking)")
+        print(f"  {verb} create  {n_sc_create:3} special LM categor(y/ies) (transfer/tracking)")
     if n_sc_recover:
         print(f"  {verb} recover {n_sc_recover:3} special LM categor(y/ies) into sync state")
     if n_sc_synced:
         print(f"  Skip     {n_sc_synced:3} already-synced special categor(y/ies)")
 
-    nothing_to_do = (n_create_g == 0 and n_create_c == 0 and n_recover_g == 0
-                     and n_recover_c == 0
+    nothing_to_do = (n_create_g == 0 and n_create_c == 0
                      and n_sc_create == 0 and n_sc_recover == 0)
     if nothing_to_do:
         return
@@ -1370,13 +1405,32 @@ def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
                 cur_group = item["group_name"]
                 print(f"      {BOLD}{cur_group}{RESET}")
             flags = "  [archived]" if item.get("archived") else ""
-            print(f"        {item['name']}{flags}")
+            lm_name = item.get("lm_name", item["name"])
+            rename = f"  {YELLOW}→ '{lm_name}'{RESET}" if lm_name != item["name"] else ""
+            print(f"        {item['name']}{flags}{rename}")
 
     if n_sc_create or n_sc_recover:
         print(f"\n    {CYAN}Special categories (exclude from budget + totals){RESET}")
         for item in (i for i in plan if i["action"] in (_SC_CREATE, _SC_RECOVER)):
             verb2 = "create" if item["action"] == _SC_CREATE else "recover"
             print(f"      {verb2}  '{item['name']}'")
+
+
+
+def _record_ynab_internal_cats(ynab_groups_raw: list[dict[str, Any]],
+                               sync: SyncState, sync_dir: Path) -> None:
+    """Store UUIDs of intentionally-unmapped internal categories for Phase 1 error detection."""
+    changed = False
+    for group in ynab_groups_raw:
+        for cat in group.get("categories", []):
+            if not cat.get("internal") or cat.get("deleted"):
+                continue
+            role = YNAB_UNMAPPED_INTERNAL_CATS.get(cat["name"])
+            if role and sync.ynab_internal_cat(role) != cat["id"]:
+                sync.set_ynab_internal_cat(role, cat["id"])
+                changed = True
+    if changed:
+        sync.save(sync_dir)
 
 
 def _mapping_exclude_category(data_dir: Path, lm_id: int) -> None:
@@ -1397,104 +1451,85 @@ def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir
     """Plan and optionally execute category + category-group sync. Returns count of changes."""
     ynab_groups_raw: list[dict[str, Any]] = load_json(data_dir, "categories")
 
+    _record_ynab_internal_cats(ynab_groups_raw, sync, sync_dir)
+
     print("  Fetching Lunch Money categories...")
     lm_cats_raw = client.get_categories()
 
-    # Index existing LM entities by custom_metadata.ynab_id for crash recovery
-    lm_groups_by_ynab_id: dict[str, CategoryObject] = {}
-    lm_cats_by_ynab_id:   dict[str, Any] = {}
     lm_cats_all: dict[int, AnyCategory] = {}
     for g in lm_cats_raw:
         lm_cats_all[g.id] = g
-        meta = g.custom_metadata or {}
-        if meta.get("ynab_id"):
-            lm_groups_by_ynab_id[meta["ynab_id"]] = g
         for c in (g.children or []):
             lm_cats_all[c.id] = c
-            cmeta = c.custom_metadata or {}
-            if cmeta.get("ynab_id"):
-                lm_cats_by_ynab_id[cmeta["ynab_id"]] = c
 
-    plan = _build_category_plan(ynab_groups_raw, sync,
-                                lm_groups_by_ynab_id, lm_cats_by_ynab_id)
+    plan = _build_category_plan(ynab_groups_raw, sync)
     plan += _build_special_cat_plan(sync, lm_cats_all)
     _print_category_plan(plan, apply)
 
     actionable = [i for i in plan
-                  if i["action"] in (_CG_CREATE, _CG_RECOVER, _CC_CREATE, _CC_RECOVER,
-                                     _SC_CREATE, _SC_RECOVER)]
+                  if i["action"] in (_CG_CREATE, _CC_CREATE, _SC_CREATE, _SC_RECOVER)]
     if not actionable:
         print(f"\n  {GREEN}Nothing to do.{RESET}")
         return 0
 
     if not apply:
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
-        return 0
+        return len(actionable)
 
     print()
     changes = 0
 
     # Process groups first so their LM IDs are in sync_state before categories need them
     for item in plan:
-        if item["action"] not in (_CG_CREATE, _CG_RECOVER):
+        if item["action"] != _CG_CREATE:
             continue
         if confirm_each:
-            resp = input(f"  Apply group '{item['name']}' [{item['action']}]? [y/N] ").strip().lower()
+            resp = input(f"  Apply group '{item['name']}' [create]? [y/N] ").strip().lower()
             if resp != "y":
                 print(f"  {DIM}Skipped.{RESET}")
                 continue
-
-        if item["action"] == _CG_CREATE:
-            result = client.create_category(CreateCategoryRequestObject(
-                name=item["name"],
-                is_group=True,
-                custom_metadata={"ynab_id": item["ynab_id"]},
-            ))
-            sync.set_category_group(item["ynab_id"], lm_id=result.id, lm_name=result.name)
-            sync.save(sync_dir)
-            print(f"  {GREEN}✓{RESET} Created group  '{item['name']}'  → LM {result.id}")
-            changes += 1
-
-        elif item["action"] == _CG_RECOVER:
-            sync.set_category_group(item["ynab_id"], lm_id=item["lm_id"], lm_name=item["lm_name"])
-            sync.save(sync_dir)
-            print(f"  {GREEN}✓{RESET} Recovered group '{item['name']}'  → LM {item['lm_id']}")
-            changes += 1
+        result = client.create_category(CreateCategoryRequestObject(
+            name=item["name"],
+            is_group=True,
+        ))
+        sync.set_category_group(item["ynab_id"], lm_id=result.id, lm_name=result.name)
+        sync.save(sync_dir)
+        print(f"  {GREEN}✓{RESET} Created group  '{item['name']}'  → LM {result.id}")
+        changes += 1
 
     # Then categories
     for item in plan:
-        if item["action"] not in (_CC_CREATE, _CC_RECOVER):
+        if item["action"] != _CC_CREATE:
             continue
         if confirm_each:
-            resp = input(f"  Apply cat '{item['name']}' [{item['action']}]? [y/N] ").strip().lower()
+            resp = input(f"  Apply cat '{item['name']}' [create]? [y/N] ").strip().lower()
             if resp != "y":
                 print(f"  {DIM}Skipped.{RESET}")
                 continue
-
-        if item["action"] == _CC_RECOVER:
-            lm_group_id = sync.lm_category_group_id(item["ynab_group_id"])
-            sync.set_category(item["ynab_id"], lm_id=item["lm_id"], lm_name=item["lm_name"],
-                              lm_group_id=lm_group_id)
-            sync.save(sync_dir)
-            print(f"  {GREEN}✓{RESET} Recovered cat  '{item['name']}'  → LM {item['lm_id']}")
-            changes += 1
-
-        elif item["action"] == _CC_CREATE:
-            lm_group_id = sync.lm_category_group_id(item["ynab_group_id"])
+        ynab_group_id = item.get("ynab_group_id")
+        if ynab_group_id:
+            lm_group_id = sync.lm_category_group_id(ynab_group_id)
             if lm_group_id is None:
                 print(f"  {YELLOW}⚠{RESET}  Skipping '{item['name']}' — parent group not yet in sync state")
                 continue
-            result = client.create_category(CreateCategoryRequestObject(
-                name=item["name"],
-                group_id=lm_group_id,
-                archived=item.get("archived", False),
-                custom_metadata={"ynab_id": item["ynab_id"]},
-            ))
-            sync.set_category(item["ynab_id"], lm_id=result.id, lm_name=result.name,
-                              lm_group_id=lm_group_id)
-            sync.save(sync_dir)
-            print(f"  {GREEN}✓{RESET} Created cat    '{item['name']}'  → LM {result.id}")
-            changes += 1
+        else:
+            lm_group_id = None
+        lm_name = item.get("lm_name", item["name"])
+        result = client.create_category(CreateCategoryRequestObject(
+            name=lm_name,
+            group_id=lm_group_id,
+            archived=item.get("archived", False),
+            is_income=item.get("is_income", False),
+        ))
+        lm_id = result.id
+        label = f"'{item['name']}' → '{lm_name}'" if lm_name != item["name"] else f"'{lm_name}'"
+        print(f"  {GREEN}✓{RESET} Created cat    {label}  → LM {lm_id}")
+        sync.set_category(item["ynab_id"], lm_id=lm_id, lm_name=lm_name or item["name"],
+                          lm_group_id=lm_group_id)
+        sync.save(sync_dir)
+        if lm_group_id is None:
+            _mapping_exclude_category(data_dir, lm_id)
+        changes += 1
 
     # Special LM-native categories
     for item in plan:
@@ -1558,16 +1593,17 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
     print(BOLD + f"\nImporting {label}  [{mode}]\n" + RESET)
 
     all_entities = entities is None
+    totals: dict[str, int] = {}
 
     if all_entities or "accounts" in entities:
         print(BOLD + "── Accounts ──" + RESET)
-        phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
-                       update_fields=update_fields, confirm_each=confirm_each)
+        totals["accounts"] = phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
+                                            update_fields=update_fields, confirm_each=confirm_each)
 
     if all_entities or "categories" in entities:
         print(BOLD + "\n── Categories ──" + RESET)
-        phase_categories(data_dir, client, sync, sync_dir, apply,
-                         confirm_each=confirm_each)
+        totals["categories"] = phase_categories(data_dir, client, sync, sync_dir, apply,
+                                                confirm_each=confirm_each)
 
     # Future phases (transactions) go here
     # NOTE: transaction import requires all accounts and categories to be
@@ -1577,10 +1613,17 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
     # behavior on missing accounts/categories (skip, abort, create) will
     # also be needed.
 
+    print(BOLD + f"\n── Summary ──" + RESET)
+    total_changes = sum(totals.values())
+    verb = "would change" if not apply else "changed"
+    for entity, count in totals.items():
+        status = GREEN + f"{count} {verb}" + RESET if count else DIM + f"nothing to {verb.split()[0]}" + RESET
+        print(f"  {entity:12} {status}")
     if not apply:
         print(f"\n{DIM}Run with --apply to execute the above changes.{RESET}\n")
     else:
-        print(f"\n{GREEN}Done.{RESET}  Sync state: {sync_dir / 'sync_state.json'}\n")
+        print(f"\n{GREEN if total_changes else DIM}{'Done' if total_changes else 'Nothing to do'}.{RESET}"
+              f"  Sync state: {sync_dir / 'sync_state.json'}\n")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

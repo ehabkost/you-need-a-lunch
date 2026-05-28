@@ -25,6 +25,13 @@ from lm_api_types_generated import (
 BASE_URL = "https://api.lunchmoney.dev/v2"
 BATCH_SIZE = 500  # max transactions per POST /transactions
 
+
+class CategoryNameExistsError(Exception):
+    """Raised when POST /categories fails because the name is already taken."""
+    def __init__(self, name: str, existing_id: int):
+        super().__init__(f"Category '{name}' already exists (id={existing_id})")
+        self.existing_id = existing_id
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -61,7 +68,18 @@ class LMClient:
                 print(f"    rate limited — waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 return self._request(method, path, body=body, params=params)
-            print(f"HTTP {e.code} {method} {path}: {e.read().decode()}", file=sys.stderr)
+            raw = e.read().decode()
+            if e.code == 400 and method == "POST" and path == "/categories":
+                try:
+                    payload = json.loads(raw)
+                    for err in payload.get("errors", []):
+                        if err.get("code") == "CATEGORY_NAME_ALREADY_EXISTS":
+                            raise CategoryNameExistsError(
+                                err["requested_name"], err["existing_category_id"]
+                            )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            print(f"HTTP {e.code} {method} {path}: {raw}", file=sys.stderr)
             sys.exit(1)
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
