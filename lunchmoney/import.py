@@ -1190,9 +1190,13 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
 
 # ── import command ────────────────────────────────────────────────────────────
 
+VALID_ENTITIES = {"accounts"}
+
+
 def cmd_import(data_dir: Path, client: LMClient, apply: bool,
                update_fields: list[str] | None = None,
-               confirm_each: bool = False) -> None:
+               confirm_each: bool = False,
+               entities: set[str] | None = None) -> None:
     meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     print("Fetching Lunch Money user info...")
@@ -1211,11 +1215,20 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
     mode  = "APPLYING" if apply else "DRY-RUN"
     print(BOLD + f"\nImporting {label}  [{mode}]\n" + RESET)
 
-    print(BOLD + "── Accounts ──" + RESET)
-    phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
-                   update_fields=update_fields, confirm_each=confirm_each)
+    all_entities = entities is None
+
+    if all_entities or "accounts" in entities:
+        print(BOLD + "── Accounts ──" + RESET)
+        phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
+                       update_fields=update_fields, confirm_each=confirm_each)
 
     # Future phases (categories, transactions) go here
+    # NOTE: transaction import requires all accounts and categories to be
+    # present in LM first. Before importing transactions, a status check is
+    # needed to verify that every YNAB account and category referenced by
+    # transactions has a corresponding LM entity. An option to control
+    # behavior on missing accounts/categories (skip, abort, create) will
+    # also be needed.
 
     if not apply:
         print(f"\n{DIM}Run with --apply to execute the above changes.{RESET}\n")
@@ -1247,6 +1260,14 @@ def main() -> None:
     p_import.add_argument(
         "--confirm-each", action="store_true",
         help="Prompt for confirmation before applying each individual change",
+    )
+    p_import.add_argument(
+        "--entities",
+        metavar="ENTITIES",
+        help=(
+            f"Comma-separated list of entity types to import, "
+            f"or 'all' (default). Valid values: {', '.join(sorted(VALID_ENTITIES))}"
+        ),
     )
 
     args = parser.parse_args()
@@ -1285,8 +1306,17 @@ def main() -> None:
                     print(f"Error: unknown update field(s): {', '.join(unknown)}", file=sys.stderr)
                     print(f"Valid fields: {', '.join(UPDATABLE_FIELDS)}", file=sys.stderr)
                     sys.exit(1)
+        entities: set[str] | None = None
+        if args.entities and args.entities.strip() != "all":
+            entities = {e.strip() for e in args.entities.split(",")}
+            unknown = entities - VALID_ENTITIES
+            if unknown:
+                print(f"Error: unknown entity type(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+                print(f"Valid values: {', '.join(sorted(VALID_ENTITIES))}", file=sys.stderr)
+                sys.exit(1)
         cmd_import(data_dir, client, apply=args.apply,
-                   update_fields=update_fields, confirm_each=args.confirm_each)
+                   update_fields=update_fields, confirm_each=args.confirm_each,
+                   entities=entities)
 
 
 if __name__ == "__main__":
