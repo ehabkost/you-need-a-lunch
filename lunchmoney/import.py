@@ -1500,9 +1500,13 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
 
     if all_entities or "categories" in entities:
         print(BOLD + "\n── Categories ──" + RESET)
-        mapping = Mapping.load(data_dir)
-        phase_categories(data_dir, client, sync, sync_dir, mapping, apply,
-                         confirm_each=confirm_each)
+        mapping_path = data_dir / MAPPING_FILE
+        if not mapping_path.exists():
+            print(f"  {YELLOW}Skipped — no mapping.yaml found. Run 'fix-mapping' first.{RESET}")
+        else:
+            mapping = Mapping.load(data_dir)
+            phase_categories(data_dir, client, sync, sync_dir, mapping, apply,
+                             confirm_each=confirm_each)
 
     # Future phases (transactions) go here
     # NOTE: transaction import requires all accounts and categories to be
