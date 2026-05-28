@@ -55,28 +55,30 @@ is_zero            = txn.amount == 0
 
 | Category | Situation | Action |
 |---|---|---|
-| `Inflow: Ready to Assign` | Transfer inflow side | Skip; record `ynab_id` in sync_state for dedup |
+| `Inflow: Ready to Assign` | Transfer inflow side | Import as "Payment, Transfer" (both transfer legs must be imported) |
 | `Inflow: Ready to Assign` | Non-transfer income | Import with mapped LM income category |
 | `Inflow: Ready to Assign` | Starting Balance, zero | Skip |
 | `Inflow: Ready to Assign` | Starting Balance, non-zero | Import as opening balance, null category |
-| `Uncategorized` | Transfer outflow side | Import as transfer, null category |
+| `Uncategorized` | Transfer outflow side | Import as "Payment, Transfer" (both transfer legs must be imported) |
 | `Uncategorized` | Regular spending | Import, null category, flag `ynab_uncategorized=true` |
 | `Uncategorized` | Starting Balance, zero | Skip |
 | `Uncategorized` | Starting Balance, non-zero | Import as opening balance, null category |
 | `Deferred Income SubCategory` | Any | Warn + require user decision (abort unless resolved in sync_state) |
-| `Credit Card Payments` group | Any | Warn + treat as uncategorized (should not occur in practice) |
+| `Credit Card Payments` group | Any | **Abort (hard error)** — pre-flight must detect this; should never occur |
 
 ### Transfer strategy
 
-YNAB creates two paired transactions per transfer; LM uses one-sided entries.
+LM has no native transfer pairing. The recommended approach (per LM support docs) is to import **both legs** as separate transactions, both categorized as LM's default **"Payment, Transfer"** category (exclude-from-budget + exclude-from-totals). The Transfer Management Tool (see `future-tools.md`) can later group them.
 
-- Process the **outflow side only** (negative amount, source account). Skip the inflow side but record both `ynab_id`s in `custom_metadata` (`ynab_id` + `ynab_paired_id`) for dedup on re-runs.
-- If the destination account was not migrated (excluded or Plaid read-only): import the outflow as a regular transaction with null category and original payee text.
-- Cross-currency transfers (e.g. BRL ↔ CAD): YNAB stores two independent transactions with different amounts. Import as two unpaired regular transactions with `custom_metadata.ynab_cross_currency_transfer=true`.
+- Import **both** the outflow and inflow legs. Category for both = "Payment, Transfer".
+- Look up the LM "Payment, Transfer" category ID once during Phase 0; create it if missing.
+- Store `ynab_paired_id` on both transactions so the Transfer Management Tool can match and group them.
+- If one account was not migrated (excluded or Plaid read-only): import only the migrated leg as "Payment, Transfer"; skip the other.
+- Cross-currency transfers (e.g. CAD checking → BRL account within the same budget): import both legs in their respective account currencies. Leave them **ungrouped** — LM does not produce a meaningful zero total when grouping cross-currency transactions.
 
 ### Credit card transactions
 
-No special handling required at the transaction level. CC spending is recorded on the CC account with real spending categories, same as any other account. CC payments are transfers (covered above). The "Credit Card Payment" budget categories are a YNAB budgeting abstraction with no transaction footprint — they are skipped in Phase 0 and never appear on transactions.
+No special handling required at the transaction level. CC spending is recorded on the CC account with real spending categories, same as any other account. CC payments are transfers — both the checking debit and the CC credit are imported as "Payment, Transfer" per the transfer strategy above. The "Credit Card Payment" budget categories are a YNAB budgeting abstraction with no transaction footprint — they are skipped in Phase 0 and must never appear on actual transactions (abort if found).
 
 ### Opening balances
 
