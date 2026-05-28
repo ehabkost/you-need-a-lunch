@@ -103,37 +103,62 @@ The entire "Credit Card Payments" group is skipped in Phase 0 (correct). Pre-fli
 
 ---
 
+## Tracking ("Off-Budget") Account Handling
+
+YNAB distinguishes **on-budget** from **off-budget** ("Tracking") accounts. Transactions on tracking accounts don't affect category balances; they affect net worth only.
+
+**LM model** (per [Category Properties](https://support.lunchmoney.app/setup/categories/category-properties) and [Managing Accounts](https://support.lunchmoney.app/setup/accounts/managing-accounts)):
+- LM has no per-account "exclude from budget" toggle. Budget exclusion is **category-driven** via the `Exclude from budget` and `Exclude from totals` category properties.
+- LM accounts do expose a `Do not track transactions` toggle, but it disables manual transactions entirely — not suitable for tracking-account history that already has transactions.
+
+**Decision**: For YNAB tracking accounts, import transactions but map them to a dedicated **"Tracking (off-budget)"** category with both `exclude_from_budget=true` and `exclude_from_totals=true`. Create this category once in Phase 0 if missing. Look up its ID and use it for any transaction whose source YNAB account is `on_budget=false`, overriding the category resolution from the decision table above (except transfers — transfers always use "Payment, Transfer").
+
+**Dry-run**: count these as a separate bucket `tracking (off-budget): N` so the user sees their volume.
+
+## Multi-Currency Category Totals
+
+Confirmed via LM docs ([Multicurrency](https://support.lunchmoney.app/settings/multicurrency)): LM converts all amounts to the **primary currency** using **historical FX rates** (rate of the transaction date) for category totals, budgets, and summaries. There is no per-currency category breakdown.
+
+**Implication**: When the same LM category receives transactions in multiple currencies (e.g. groceries in CAD and BRL), category-activity totals will differ from any per-currency YNAB total by the FX conversion. This is expected, not a bug. Category-balance verification (below) must convert YNAB activity through the same historical rates before comparing, or compare per-currency-per-category.
+
+## Category-Balance Verification
+
+LM has no public API for "category balance over period"; balances live on the budget endpoints. The reconciliation strategy:
+
+1. After import, for each (LM category, period) pair within the imported range, sum the imported transactions (converting to primary currency via historical rate if multi-currency).
+2. Compare against YNAB's per-category activity for the same period (from `categories` snapshots).
+3. Tolerance: zero for same-currency single-currency budgets; **±0.5%** per category-month for multi-currency (FX-rate-source differences).
+4. Output: a `category-recon.md` report flagging deltas above tolerance. Not a hard gate — informational.
+
+## Account Merging in LM
+
+Confirmed via [Managing Accounts](https://support.lunchmoney.app/setup/accounts/managing-accounts):
+- LM supports merging both manually-managed and synced accounts. Transactions, recurring items, and rules migrate to the destination account. User chooses which account's balance history to keep.
+- The merge is irreversible; the source account ID is destroyed and the destination ID stays stable.
+- LM docs don't specify the fate of `external_id` / `custom_metadata` on a merge. **Implication for re-sync**: after a user merges accounts post-import, the source account's `external_id` (`ynab:{budget}:{account}`) is gone, so the next sync run can't find it. This is one of the v1 known failure modes (see Open Question 5 below).
+
 ## Open Questions
 
 ### 1. "Deferred Income" semantics are undefined
 Case 9 defers to the user, but the doc never defines what YNAB's "Deferred Income SubCategory" represents, when YNAB auto-creates it, or whether it can carry a non-zero balance across the cutoff date. Research the YNAB behaviour and document a canonical mapping recommendation before asking the user to choose.
 
-### 2. In-budget vs. off-budget account handling is unspecified
-YNAB distinguishes on-budget from off-budget ("Tracking") accounts. Transactions on tracking accounts don't affect category balances. The LM equivalent (excluding accounts from budget calculations) needs to be set per account, and transactions on tracking accounts must not be assigned categories that would distort LM's category totals. The plan currently treats all accounts identically.
-
-### 3. No method for verifying category balances match post-import
-Account balance reconciliation is documented (balance-reconciliation.md) but there's no equivalent for category balances. Need: a pass that sums imported transactions per LM category and compares against YNAB's category activity for the same date range, plus a documented tolerance.
-
-### 4. Transfer-leg metadata rules are missing
+### 2. Transfer-leg metadata rules are missing
 The pairing strategy covers `ynab_id` / `ynab_paired_id` but is silent on per-leg metadata: memo/notes, flags, cleared status, approved status, original payee strings. Both YNAB legs can carry different values; need explicit rules (e.g. preserve each leg's own memo; store both flag colors in `custom_metadata`).
 
-### 5. Category balance reconstruction under partial import (`--since`)
-Account balances are repaired via opening-balance transactions, but categories have no "opening balance" concept. When history before the cutoff is excluded, category balances cannot be reconstructed the same way.
+### 3. Category balance reconstruction under partial import (`--since`)
+Account balances are repaired via opening-balance transactions, but categories have no "opening balance" concept (LM categories don't support synthetic opening entries the way accounts do). When history before the cutoff is excluded, category balances cannot be reconstructed the same way. Options to consider: (a) accept that pre-cutoff activity is invisible to category reports; (b) synthesise a single excluded-from-totals "pre-cutoff catch-up" transaction per category; (c) document that category-balance verification is only meaningful for periods entirely inside the import window.
 
-### 6. Late-arriving (earlier) transactions break opening balances
+### 4. Late-arriving (earlier) transactions break opening balances
 If a user runs `--since 1y` and later backfills older history, the synthesised opening-balance transactions will double-count. Need: a documented backfill procedure, a `sync_state` field tracking the current cutoff date, and detection logic that adjusts or removes opening-balance entries when an earlier cutoff is requested.
 
-### 7. Debt accounts have unreconcilable balances without a synthetic interest entry
+### 5. Debt accounts have unreconcilable balances without a synthetic interest entry
 Per [mortgage-debt-tracking.md](mortgage-debt-tracking.md), YNAB debt accounts embed accrued interest into the account `balance` with no corresponding transactions. After importing transactions, a synthetic "Accrued Interest" adjustment may be needed. See the debt-tracking doc for details.
 
-### 8. Re-sync after the user has been actively using LM (deferred)
-If the user merges LM accounts, moves transactions, or splits/merges categories after the initial import, sync_state goes stale and re-runs will misbehave. **Not supported in v1.** Document known failure modes for future implementers.
+### 6. Re-sync after the user has been actively using LM (deferred)
+If the user merges LM accounts (see "Account Merging in LM" above — `external_id` survival is unverified), moves transactions, or splits/merges categories after the initial import, sync_state goes stale and re-runs will misbehave. **Not supported in v1.** Document known failure modes for future implementers.
 
-### 9. Config file for per-import-pair settings
+### 7. Config file for per-import-pair settings
 Options like `--opening-balance-category` and `--deferred-income-as` are per-import-pair settings that belong in a version-controllable config file rather than CLI flags.
 
-### 10. LM account-merging behaviour is unverified
-The post-import workflow in [multi-currency-strategy.md](multi-currency-strategy.md) assumes the user can merge/restructure LM accounts. Verify: Does LM support merging manual accounts? What happens to `external_id`, `custom_metadata`, and transaction history? Does the surviving account's ID stay stable?
-
-### 11. LM multi-currency category-balance semantics are unverified
-When transactions in two currencies share an LM category, does LM compute a per-currency total, a base-currency total via FX, or both? Tracked in [multi-currency-strategy.md](multi-currency-strategy.md).
+### 8. `external_id` / `custom_metadata` survival across LM account merge
+LM docs confirm merge migrates transactions, recurring items, and rules — but don't say whether the destination account inherits the source's `external_id` or `custom_metadata`, nor whether transaction-level `custom_metadata.ynab_id` survives. Needs API-level verification (test merge of two manual accounts with metadata set). Drives whether re-sync can detect a post-merge account via stable IDs.

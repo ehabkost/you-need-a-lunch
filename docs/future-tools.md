@@ -55,3 +55,65 @@ This tool automates that workflow:
 - **Dry-run summary**: show proposed pairs and ungrouped orphans before applying anything.
 - **On apply**: set category to "Payment, Transfer" on both legs if not already set, then create an LM transaction group linking the two.
 - **Do not use "create transfer"** on already-imported transactions — that generates a spurious third entry.
+
+## Shared Concern: Silent Budget Leaks via Exclude-From-Totals Categories
+
+Both `Payment, Transfer` and `Tracking (off-budget)` rely on the same LM mechanism — `exclude_from_budget` + `exclude_from_totals` — to keep certain transactions out of budget math. That mechanism is also the failure mode: any transaction that lands in either category disappears from budget totals, and an accidental mis-categorization (or a property toggle on the category itself) silently leaks real spending out of the budget.
+
+The Transfer Management Tool and the Tracking-Category Audit Tool below should share infrastructure for this:
+
+- **Common checks**: category-property drift (both exclude flags still set), unexpected volume spikes month-over-month, account/category coherence (txn's source account makes sense for the category).
+- **Common "suspicious" surface**: a unified report listing every transaction currently excluded from budget totals, with the reason (transfer vs tracking vs other exclude-from-totals categories) and a confidence score that it belongs there.
+- **Shared primitives**: a `find_excluded_transactions(period)` helper, a `category_properties_unchanged(category_id, expected)` check, and the volume-baseline computation should live in one module both tools call.
+
+Treat this as one auditing subsystem with two specialized front-ends, not two independent tools.
+
+## Tracking-Category Audit Tool
+
+The import maps YNAB off-budget ("Tracking") account transactions to a dedicated `Tracking (off-budget)` LM category with `exclude_from_budget=true` and `exclude_from_totals=true` (see [transaction-import-plan.md](transaction-import-plan.md)). Because that category is invisible to budgets and totals, accidental misuse is silent: money can leave a real on-budget account and never show up in any budget bucket.
+
+This tool periodically audits the category to catch drift:
+
+- **Account/category coherence**: every transaction in `Tracking (off-budget)` should be on an LM account whose source YNAB account had `on_budget=false` (recorded in `custom_metadata.ynab_on_budget` or derivable from the account's `external_id`). Flag any transaction in the tracking category that sits on an on-budget account.
+- **Inverse check**: any transaction on a tracking-source account that is *not* in the tracking category (and not in `Payment, Transfer`) is also suspicious — either the user re-categorized it deliberately or the importer mis-routed it. Surface both.
+- **Category-property drift**: verify the category still has both `exclude_from_budget` and `exclude_from_totals` set. A user who accidentally toggles either flag would silently start double-counting tracking activity in budget totals.
+- **Volume check**: compare the count and absolute-sum of tracking-category transactions per month against the prior month. A large spike likely means a real on-budget transaction landed there by mistake.
+- **Output**: a report with proposed re-categorizations; never auto-apply. The user picks per-row.
+
+This is a maintenance tool, not part of import — run it on demand or on a schedule against the live LM account.
+
+## Account-Merging Helper Tool
+
+LM supports merging accounts ([Managing Accounts](https://support.lunchmoney.app/setup/accounts/managing-accounts)), and the multi-currency strategy assumes the user will restructure accounts after import. Doing this by hand is risky for an imported budget: the source account's `external_id` and `custom_metadata` may or may not survive the merge (unverified — see open question in [transaction-import-plan.md](transaction-import-plan.md)), which breaks future re-sync.
+
+This tool wraps the merge with pre/post hooks that protect sync_state:
+
+### Pre-merge
+
+- Read both accounts via the LM API; capture their full `external_id`, `custom_metadata`, balance, balance history, and transaction count.
+- Read local `sync_state` and identify which YNAB account(s) map to each LM account.
+- Show a dry-run summary:
+  - Source → destination
+  - Whether either is Plaid-synced (warn: source must be manual, or LM merge flow differs)
+  - Currency match (warn loudly on mismatch — merging across currencies destroys balance-history coherence)
+  - Which YNAB accounts in `sync_state` will need their mapping re-pointed
+  - Counts of transactions, recurring items, and rules that will migrate
+- Require explicit confirmation.
+
+### Merge
+
+- Use the LM API to merge (or instruct the user to perform the UI merge if no API exists — verify before building).
+- Capture the destination account's post-merge `external_id` and `custom_metadata`.
+
+### Post-merge
+
+- Detect what survived: did the destination inherit the source's `external_id`? Did transaction-level `custom_metadata.ynab_id` survive on migrated transactions? (Sample-check a few.)
+- If `external_id` was lost: write the source's `external_id` onto the destination via the LM API. If LM rejects (uniqueness conflict — e.g. destination already had its own), fall back to storing it in `custom_metadata.ynab_external_ids` as a list.
+- Update local `sync_state`: re-point every YNAB account that mapped to the source so it now maps to the destination's LM ID. Record the merge in a `sync_state.merges` audit log with timestamp, source ID, destination ID, and which metadata fields were preserved/lost.
+- Re-run the deduplication check from the importer against the destination account, since merge can introduce duplicates if both accounts had overlapping manual entries.
+
+### Safety
+
+- Refuse to merge if either account has unsynced changes in `sync_state` (pending import).
+- Always print a recovery hint: which JSON file holds the pre-merge snapshot, so the user can manually reconstruct mappings if something goes wrong.
+- Never delete the local pre-merge snapshot — merges are irreversible in LM and the snapshot is the only audit trail.
