@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Quick smoke test for YNAB API access. Run with:
-  ./ynab-run.sh python test_ynab.py [budget-id]
+  ./prod-run.sh python test_ynab.py [budget-id]
 """
 import os
 import sys

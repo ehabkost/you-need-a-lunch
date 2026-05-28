@@ -24,7 +24,7 @@ cat_name            = txn.category_name  # may be None
 | 7 | `Uncategorized` + Starting Balance + zero | **Skip** | — | Pure metadata |
 | 8 | `Uncategorized` + Starting Balance + non-zero | **Import as opening balance** | null | Same as case 4; negative amount handles liability accounts |
 | 9 | `Deferred Income SubCategory` on any txn | **Warn + require user decision** | — | Per CLAUDE.md: offer choices — (a) treat as income, (b) treat as uncategorized, (c) skip. Cache decision in sync_state |
-| 10 | `Credit Card Payments` group categories | **Abort (hard error)** | — | Pre-flight scan must detect these and abort before any writes; should never occur in practice |
+| 10 | `Credit Card Payments` group categories on a transaction | **N/A — does not occur** | — | Confirmed: zero transactions reference these categories. The group is imported as a normal (empty) group; no transaction is ever assigned to it. See [credit-cards.md](credit-cards.md). |
 
 ## Transfer Strategy (cases 1 & 5)
 
@@ -59,8 +59,10 @@ transactions:
   skipped (zero-amount starting bal):          N
   skipped (deleted):                           N
   needs user decision (Deferred Inc.):         N
-  ABORT — unexpected CC Payment category:      N  ← hard stop if > 0
 ```
+
+(No CC-Payment-category bucket: those categories are created empty in Phase 0 and
+never receive transactions. See [credit-cards.md](credit-cards.md).)
 
 ## Edge Cases
 
@@ -79,27 +81,31 @@ transactions:
 
 ## Credit Card Transactions
 
-YNAB's CC budgeting model (auto-generated "Credit Card Payment" categories, budget-side fund shifts) is a pure budgeting abstraction with no transaction-level footprint. CC accounts behave like any other liability account for import — no special-casing required at the transaction level.
+See **[credit-cards.md](credit-cards.md)** for the full treatment.
 
-### Decision table
+Summary: YNAB's CC budgeting model (auto-generated "Credit Card Payment"
+categories, budget-side fund shifts) is a pure budgeting abstraction with **no
+transaction-level footprint**. CC accounts import as ordinary liability accounts
+and need **no special-casing at the transaction level**:
 
-| YNAB transaction shape | LM treatment |
-|---|---|
-| Expense on CC account with real category (Groceries, Uber Eats, etc.) | Import as normal expense on the LM CC (liability) account. Map category via sync_state. No special handling. |
-| CC payment: transfer checking → CC, `category='Uncategorized'`, `payee='Transfer : ...'` | Import **both** legs as "Payment, Transfer" per the transfer strategy above. |
-| `cat='Inflow: Ready to Assign'`, `amount=0`, `payee='Starting Balance'` on CC | Skip (existing rule). |
-| `cat='Inflow: Ready to Assign'`, `amount≠0`, `payee='Starting Balance'` on CC | Import as opening balance on the LM CC account (existing rule). |
-| `cat='Inflow: Ready to Assign'`, `amount≠0`, `payee='Manual Balance Adjustment'` or `'Reconciliation Balance Adjustment'` on CC | Import as plain transaction, null category, preserve payee text. Flag in dry-run summary. |
-| Refund/return on CC (positive-amount expense with real category) | Import as-is — LM handles positive amounts on liability accounts fine. |
+- CC purchases → normal expenses on the LM CC (Credit) account, real category
+  mapped via sync_state.
+- CC payments (checking → CC) → both legs as "Payment, Transfer" (the
+  [Transfer Strategy](#transfer-strategy-cases-1--5) above).
+- Opening balances, manual/reconciliation adjustments, refunds, interest → handled
+  by the existing decision-table and edge-case rules.
 
-### "Credit Card Payment" budget categories
+The **"Credit Card Payments" category group is imported as a normal group** in
+Phase 0. Its per-card categories (e.g. `Edu Credit CIBC Visa 💳`,
+`Costco Mastercard 🛒`) are created in LM but stay **empty** — confirmed: zero
+transactions reference them. They are harmless; the user may archive or delete
+them after import. There is **no pre-flight abort** for these categories (the
+shape that abort guarded against does not occur).
 
-The entire "Credit Card Payments" group is skipped in Phase 0 (correct). Pre-flight must **abort** if any transaction carries a `Credit Card Payments` group category — this should never occur, and if it does it indicates an unexpected YNAB data shape that must be resolved manually before import.
-
-### Other CC edge cases
-
-- **Foreign-currency CCs**: the account-exclusion rules (multi-budget.md) handle this at the account level. Transfer-skip logic must check exclusion on *both* legs.
-- **CC interest charges**: usually manual expenses with a real category. No special handling; flag in dry-run so user can verify reconciliation.
+Note: the group is flagged `internal: true` in the YNAB export, but its member
+categories are not — so Phase 0's group-skip rule (skip only if no importable
+categories) passes it through without any special-casing. See
+[credit-cards.md](credit-cards.md).
 
 ---
 

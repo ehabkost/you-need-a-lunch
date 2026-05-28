@@ -79,6 +79,9 @@ class SyncStateData(BaseModel):
     accounts: dict[str, AccountEntry] = Field(default_factory=dict)
     category_groups: dict[str, CategoryGroupEntry] = Field(default_factory=dict)
     categories: dict[str, CategoryEntry] = Field(default_factory=dict)
+    # LM-native categories with no YNAB equivalent (keyed by role name)
+    # Keys: "payment_transfer", "tracking_off_budget"
+    special_categories: dict[str, int] = Field(default_factory=dict)
 
 
 class SyncState:
@@ -140,6 +143,14 @@ class SyncState:
         self._d.categories[ynab_id] = CategoryEntry(
             lm_id=lm_id, lm_name=lm_name, lm_group_id=lm_group_id, synced_at=_now(),
         )
+
+    # ── special LM-native categories ─────────────────────────────────────────
+
+    def special_cat_id(self, key: str) -> Optional[int]:
+        return self._d.special_categories.get(key)
+
+    def set_special_cat(self, key: str, lm_id: int) -> None:
+        self._d.special_categories[key] = lm_id
 
     # ── lookups ───────────────────────────────────────────────────────────────
 

@@ -4,10 +4,10 @@
 Automatically does a delta update if a checkpoint exists, otherwise a full export.
 
 Usage:
-  ./ynab-run.sh ./ynab/export.py                      # list budgets
-  ./ynab-run.sh ./ynab/export.py --budget ID          # export (auto: delta or full)
-  ./ynab-run.sh ./ynab/export.py --budget ID --full   # force full export
-  ./ynab-run.sh ./ynab/export.py --budget ID --out DIR
+  ./prod-run.sh ./ynab/export.py                      # list budgets
+  ./prod-run.sh ./ynab/export.py --budget ID          # export (auto: delta or full)
+  ./prod-run.sh ./ynab/export.py --budget ID --full   # force full export
+  ./prod-run.sh ./ynab/export.py --budget ID --out DIR
 """
 import argparse
 import json
