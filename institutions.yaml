@@ -86,6 +86,9 @@ account_keywords:
   - match: [Pension]
     type: investment
     subtype: retirement
+  - match: [DPSP]
+    type: investment
+    subtype: retirement
   - match: [ESPP]
     type: employee compensation
   - match: [GIC]
