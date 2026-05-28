@@ -6,7 +6,11 @@ This document is more specific than [multi-budget.md](multi-budget.md) (which co
 
 ## Current YNAB-side reality
 
-There is **one** YNAB budget, denominated in CAD. It contains two kinds of accounts:
+There are **two** YNAB budgets:
+
+### CAD budget (`data/cad/`) — active, current
+
+Denominated in CAD. Contains two kinds of accounts:
 
 1. **Real CAD bank accounts** — full per-transaction history, amounts in CAD milliunits. Behaves like a normal YNAB account.
 2. **BRL-proxy accounts** — represent real BRL bank accounts that physically exist in Brazil, tracked in the CAD budget as:
@@ -15,7 +19,9 @@ There is **one** YNAB budget, denominated in CAD. It contains two kinds of accou
    - Some non-balance-adjustment transactions also exist on these accounts (categorised entries, transfers), but they are **planning approximations of real-world BRL activity, not authoritative records**, and have no meaningful category assignment. Losing them is acceptable.
    - Real CAD↔BRL money movements (e.g. CAD chequing → convert → BRL bank) **are recorded as in-YNAB transfers** between a CAD account and the BRL-proxy account. The CAD leg is authoritative (real money left a real CAD account); the BRL leg is a CAD-equivalent placeholder.
 
-There is **no separate BRL YNAB budget**. The "second budget" scenario described in `multi-budget.md` is historical / hypothetical and does not currently apply.
+### BRL budget (`data/brl/`) — separate, historical, no longer actively maintained
+
+Denominated in BRL. Contains real BRL bank accounts with real BRL-denominated transaction history. This budget is out of date (no longer actively maintained), but the historical transaction data is worth importing into LM for a complete financial picture.
 
 ### What this means in practice
 
@@ -77,13 +83,13 @@ This means the importer does **not** need to solve manual-seeding or BRL account
 - Preserve enough metadata on the orphaned CAD-side transfer legs that the user (or a future tool) can find and re-pair them later.
 - Stay re-run-safe so it doesn't fight the manual cleanup.
 
-## The "import everything and accept duplication" scenario — why it's moot
+## Avoiding duplication across the two budgets
 
-The original framing of this question imagined a world where both a CAD budget and a separate BRL budget existed, both tracking the same BRL banks. Importing both would duplicate the BRL balance in LM (once as a CAD-equivalent shadow, once natively).
+Both budgets reference the same real-world BRL bank accounts:
+- The CAD budget tracks them as off-budget BRL-proxy accounts (CAD-valued snapshots).
+- The BRL budget tracks them as native BRL accounts with real transaction history.
 
-Since the separate BRL budget no longer exists, **this duplication scenario does not currently apply**. The only duplication risk is the BRL-proxy accounts themselves, which Option A eliminates by exclusion.
-
-If a separate BRL budget is ever reintroduced, this concern returns and the new budget's import will need to reconcile against the already-existing LM BRL accounts. See the deferred questions below.
+Importing both naively would create duplicate LM accounts for those BRL banks. Option A eliminates this: by excluding the BRL-proxy accounts from the CAD budget import, only the BRL budget's accounts become the source of truth for the BRL banks in LM. No duplication.
 
 ## Required importer features
 
@@ -122,11 +128,11 @@ Relevant if/when multiple YNAB budgets feed one LM account (see next section). N
 
 The user is comfortable with **not** tracking BRL category balances precisely, since BRL transactions to be imported are mostly historical. If LM's multi-currency category support is weak, the per-budget-prefixed categories approach below is sufficient.
 
-## Deferred: multiple YNAB budgets → single LM account
+## Two YNAB budgets → single LM account
 
-Not currently in scope. Captured here so the design doesn't paint itself into a corner.
+This is **in scope for v1** — the BRL budget's historical data must be imported alongside the CAD budget into the same LM account.
 
-Open questions to revisit if a second YNAB budget (e.g. a real BRL budget) is ever added:
+Open questions to resolve before implementing the BRL budget import:
 
 1. **Matching against existing LM accounts**. If the BRL banks already exist in LM (created by the user during the sort-out-the-mess stage), the second budget's import must match against them rather than re-creating. This is the **only** "match against existing LM entities" case that survives the create-from-scratch strategy shift; it will need explicit config — a map of `(ynab_account_id_in_new_budget → existing_lm_account_id)` — rather than name-based heuristics.
 
@@ -143,8 +149,9 @@ Open questions to revisit if a second YNAB budget (e.g. a real BRL budget) is ev
 
 ## Summary
 
-- Today: one CAD YNAB budget; BRL banks tracked as off-budget CAD-valued snapshot accounts inside it; real CAD↔BRL transfers recorded as in-YNAB transfers to those proxies.
-- v1 import strategy: **Option A** — exclude BRL-proxy accounts, import the rest of the CAD budget normally. The existing transfer-to-excluded-account rule preserves the authoritative CAD-side leg of CAD↔BRL transfers. The user manually creates BRL LM accounts during a post-import "sort out the mess" stage.
-- Required v1 importer features: per-account exclude list (config-driven), excluded-account and excluded-destination dry-run buckets.
-- Two open research items: LM account-merging behaviour, and LM multi-currency category-balance semantics.
-- Future-proofing: leave room for a second-budget import that matches against existing LM accounts; defer the per-budget category-separation choice until LM's multi-currency behaviour is understood.
+- **Two YNAB budgets**: CAD (active) + BRL (historical, out of date but worth importing).
+- **CAD budget**: import all CAD accounts + transactions normally. Exclude the BRL-proxy off-budget accounts. The transfer-to-excluded-account rule preserves the authoritative CAD-side leg of CAD↔BRL transfers.
+- **BRL budget**: import all BRL accounts + historical transactions into the same LM account. BRL accounts become the source of truth for the BRL banks in LM (no duplication with the excluded CAD-side proxies).
+- **Post-import "sort out the mess"**: user may merge or restructure LM accounts, link orphaned CAD-side transfer legs to the now-existing BRL LM accounts, etc.
+- **Required v1 importer features**: per-account exclude list; excluded-account and excluded-destination dry-run buckets; second-budget import that maps against the LM account already created by the first import.
+- **Open research items**: LM account-merging behaviour; LM multi-currency category-balance semantics; per-budget category separation strategy (prefix vs. group).
