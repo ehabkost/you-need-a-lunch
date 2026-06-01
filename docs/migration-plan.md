@@ -41,7 +41,10 @@ All YNAB categories are imported directly — no manual mapping step required.
 
 ## Phase 1: Transactions
 
-See **[transaction-import-plan.md](transaction-import-plan.md)** for the full decision table.
+See **[transaction-import-plan.md](transaction-import-plan.md)** for the full decision table,
+and **[transaction-importer-implementation.md](transaction-importer-implementation.md)** for the
+code architecture (pure classify+convert core, the API/directory sink split, and the
+directory-output mode that lets the importer be unit-tested without the LM API).
 
 ### Pre-classification flags
 
