@@ -56,6 +56,15 @@ This tool automates that workflow:
 - **On apply**: set category to "Payment, Transfer" on both legs if not already set, then create an LM transaction group linking the two.
 - **Do not use "create transfer"** on already-imported transactions — that generates a spurious third entry.
 
+### Limitation: transfers embedded in YNAB splits (partial grouping)
+
+A YNAB transfer can be one line of a split transaction (76 of 351 splits in `data/cad`). Because the importer imports splits **natively** (see [transaction-importer-implementation.md §4](transaction-importer-implementation.md)), that transfer leg becomes a **split child**, and LM's split-child schema has **no `external_id` or `custom_metadata`** — so the child itself carries no `ynab_paired_id`. The pairing is still fully recorded, just on the other side:
+
+- The **top-level counterpart** leg (always top-level — a split transfer line's other side is never itself a split sub) carries `custom_metadata.ynab_paired_id = <sub.id>`.
+- That `sub.id` resolves to the child's LM id via `sync_state.split_children`.
+
+So this tool can **identify** every pair (top-level legs via `ynab_paired_id`/`ynab_id`; split-embedded legs by resolving `ynab_paired_id` through `sync_state.split_children`). What it may **not** be able to do is **group** a split child into an LM transaction group — whether LM permits adding a split child to a group is unverified (open question 2 in the implementation plan). Outcome: **all transfers are paired in metadata; transfers where one leg lives inside a split may be ungroupable.** Surface those as "paired but not grouped" rather than as orphans.
+
 ## Shared Concern: Silent Budget Leaks via Exclude-From-Totals Categories
 
 Both `Payment, Transfer` and `Tracking (off-budget)` rely on the same LM mechanism — `exclude_from_budget` + `exclude_from_totals` — to keep certain transactions out of budget math. That mechanism is also the failure mode: any transaction that lands in either category disappears from budget totals, and an accidental mis-categorization (or a property toggle on the category itself) silently leaks real spending out of the budget.

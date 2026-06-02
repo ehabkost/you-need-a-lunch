@@ -37,7 +37,11 @@ All YNAB categories are imported directly — no manual mapping step required.
    - Same three-step check: sync_state → LM metadata match → create
    - `hidden: true` categories → create with `archived: true` in LM
    - `custom_metadata.ynab_id` set on every created category
-5. `"Inflow: Ready to Assign"` (internal): map to the first LM `is_income: true` category found; record in sync_state for use during transaction import
+5. `"Inflow: Ready to Assign"` (internal): map to the first LM `is_income: true` category found; record in sync_state for use during transaction import. Also record its YNAB UUID under `sync_state.ynab_internal_cats["inflow"]` so Phase 1 can recognise the inflow category by id (the `"uncategorized"` UUID is already recorded the same way).
+6. **Special LM-native categories** (no YNAB equivalent) needed by Phase 1, each created once (or recovered by name) with `exclude_from_budget=true` + `exclude_from_totals=true`, and recorded under `sync_state.special_categories`:
+   - `payment_transfer` → "Payment, Transfer" (both transfer legs)
+   - `tracking_off_budget` → "Tracking (off-budget)" (off-budget account transactions)
+   - `incomplete_split` → "Incomplete Split" (holding category for native split parents between the two import passes — see [transaction-importer-implementation.md §4](transaction-importer-implementation.md))
 
 ## Phase 1: Transactions
 
@@ -67,7 +71,7 @@ is_zero            = txn.amount == 0
 | `Uncategorized` | Starting Balance, zero | Skip |
 | `Uncategorized` | Starting Balance, non-zero | Import as opening balance, null category |
 | `Deferred Income SubCategory` | Any | Warn + require user decision (abort unless resolved in sync_state) |
-| `Credit Card Payments` group | Any | **Abort (hard error)** — pre-flight must detect this; should never occur |
+| `Credit Card Payments` group | Any | **N/A — does not occur.** Confirmed zero transactions reference these categories; no pre-flight abort. See [credit-cards.md](credit-cards.md). |
 
 ### Transfer strategy
 
@@ -81,7 +85,7 @@ LM has no native transfer pairing. The recommended approach (per LM support docs
 
 ### Credit card transactions
 
-No special handling required at the transaction level. CC spending is recorded on the CC account with real spending categories, same as any other account. CC payments are transfers — both the checking debit and the CC credit are imported as "Payment, Transfer" per the transfer strategy above. The "Credit Card Payment" budget categories are a YNAB budgeting abstraction with no transaction footprint — they are skipped in Phase 0 and must never appear on actual transactions (abort if found).
+No special handling required at the transaction level. CC spending is recorded on the CC account with real spending categories, same as any other account. CC payments are transfers — both the checking debit and the CC credit are imported as "Payment, Transfer" per the transfer strategy above. The "Credit Card Payments" group is imported as a normal (empty) group in Phase 0; its per-card categories receive **zero** transactions (confirmed in the data), so there is **no** pre-flight abort. See [credit-cards.md](credit-cards.md).
 
 ### Opening balances
 
@@ -95,10 +99,11 @@ No special handling required at the transaction level. CC spending is recorded o
 3. Show dry-run summary by bucket before applying:
    - income / uncategorized / transfers (paired) / transfers (one-sided) / opening balances / skipped / needs-user-decision
 4. Abort if any "needs user decision" bucket is non-zero and no resolution is cached in sync_state
-5. Convert amounts: YNAB milliunits ÷ 1000, negate sign (YNAB negative = outflow → LM positive expense)
+5. Convert amounts: **negate** then ÷1000 to a 4-dp string (YNAB negative outflow → LM positive debit). Use the single helper in [amount-conversion.md](amount-conversion.md).
 6. Store YNAB `id` in `custom_metadata.ynab_id` on every imported transaction
 7. Send to `POST /v2/transactions` in batches of **500**
 8. Process `skipped_duplicates` in each response; log with reason and count
+9. **Split transactions** are imported natively in two passes (parent insert, then `POST /transactions/split/{id}`) so each parent keeps the real charge amount for statement reconciliation. See [transaction-importer-implementation.md §4](transaction-importer-implementation.md) for the full two-pass flow, the "Incomplete Split" holding category, and the `sync_state` split tracking.
 
 ## Phase 2: Budget Assignments
 

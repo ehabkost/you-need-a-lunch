@@ -47,6 +47,27 @@ When a transfer is between accounts of different currencies (e.g. CAD checking �
 - Payee = "Starting Balance"; LM category = null by default.
 - Shown as a separate count in the dry-run summary: `opening_balances: N`.
 
+## Split Transactions
+
+YNAB split parents have `category_name == "Split"`, a `category_id` pointing at YNAB's internal
+"Split" pseudo-category, and a non-empty `subtransactions[]` list. They are **imported as native
+LM splits** (never flattened) so the parent retains the real single-charge amount and reconciles
+1:1 against a bank/Plaid statement line. Full mechanics — the two-pass insert→split flow, the
+`splitTransactionObject` constraints (no `external_id`/`custom_metadata`, `category_id` has no
+`null`), the "Incomplete Split" holding category, and `sync_state` child tracking — are in
+[transaction-importer-implementation.md §4](transaction-importer-implementation.md). Classification
+rules for the subtransactions:
+
+| Sub kind | LM split-child category | Notes |
+|---|---|---|
+| Normal spending/income sub | Mapped LM category | Same lookup as a top-level txn |
+| Transfer sub (`transfer_account_id` set) | "Payment, Transfer" | Child carries no metadata; the **top-level counterpart** leg on the other account carries `custom_metadata.ynab_paired_id = <sub.id>`. Pairing is resolvable via `sync_state.split_children`; grouping may be partial (see [future-tools.md](future-tools.md)). |
+| Uncategorized sub (`category_id` null / "Uncategorized") | null (uncategorize after split) | Tag `custom_metadata.ynab_uncategorized=true`; see implementation §4.2 |
+| `Deferred Income SubCategory` sub | per `--deferred-income-as` (case 9) | Same decision as a top-level deferred-income txn |
+
+In `data/cad`: 351 splits total — 76 contain a transfer sub, 41 contain an uncategorized sub.
+Deleted subtransactions are skipped; the remaining subs must still sum to the parent amount.
+
 ## Dry-Run Summary Buckets
 
 ```
@@ -56,6 +77,8 @@ transactions:
   transfers (both legs migrated):              N
   transfers (one leg only, other excluded):    N
   opening balances:                            N
+  splits (native parents):                     N
+  split children (created in pass 2):          N
   skipped (zero-amount starting bal):          N
   skipped (deleted):                           N
   needs user decision (Deferred Inc.):         N
@@ -71,6 +94,8 @@ never receive transactions. See [credit-cards.md](credit-cards.md).)
 3. **"Uncategorized" on inflow (positive amount, no transfer)**: rare (income never categorized in YNAB). Treat as case 6 (null category + flagged), **not** as income — preserves user intent.
 4. **Re-run safety**: every imported txn must carry `custom_metadata.ynab_id`; transfer pairs also carry `ynab_paired_id`. Lookup before insert; rely on LM's `skipped_duplicates` as a second line of defense.
 5. **Balance adjustments** (`payee='Manual Balance Adjustment'` or `'Reconciliation Balance Adjustment'`): import as plain transaction with null category, preserve payee text. Flag in dry-run summary.
+6. **Split on an off-budget (tracking) account**: the parent holds "Incomplete Split" (already excluded from budget+totals, so the off-budget override is moot for the parent); each non-transfer child gets "Tracking (off-budget)" instead of its mapped category (the same override that applies to top-level txns on off-budget accounts), while transfer children stay "Payment, Transfer".
+7. **Split child amounts must still sum to the parent** after dropping deleted subs and after sign negation — otherwise LM rejects the split with a 400 (see implementation §4.1).
 
 ## Config Knobs
 
