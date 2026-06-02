@@ -106,6 +106,27 @@ ones LM *didn't* suggest. Document this in the worklist header.
 > unversioned, and outside this tool's "API + local files" contract. Noted as a future option
 > only (Open Question 2).
 
+### 3d. Why not import future occurrences as future-dated transactions?
+
+A tempting alternative is to skip recurring items and just insert each upcoming YNAB scheduled
+occurrence as a normal transaction with a future `date`. **Rejected.** LM accepts future-dated
+transactions (the API has no date cutoff; the UI defaults new transactions to a future month's
+last day), but it treats them as **fully real, posted transactions** with no "upcoming/pending"
+holding state for manual accounts (the `is_pending` flag is **Plaid-sync-only** and "will always
+be false for transactions associated with manual accounts"). Consequences:
+
+- Future-dated transactions **immediately move the manual account's current balance** ("balances
+  are updated automatically when you add … a transaction") — overstating/understating cash for
+  money that hasn't moved, which **breaks Phase-1 balance reconciliation**
+  ([balance-reconciliation.md](balance-reconciliation.md)).
+- They **post activity into future budget periods**, polluting budgets with amounts YNAB never
+  treated as real spend.
+
+Recurring items, by contrast, are **forecast-only**: they predict and match but do not move
+balances or post budget activity until a real transaction links to them. That is exactly the
+semantics a YNAB *scheduled* transaction should carry, so the worklist (3a) targets recurring
+items, not future-dated transactions.
+
 ### 3c. Limit of auto-detection — why 3a is still needed
 
 Auto-detection only fires on **imported transactions that already exhibit the pattern**. It will
