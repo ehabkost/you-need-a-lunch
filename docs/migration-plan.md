@@ -118,6 +118,11 @@ No special handling required at the transaction level. CC spending is recorded o
 
 ## Phase 4: Scheduled Transactions
 
-- Export YNAB scheduled transactions
-- Map to Lunch Money recurring items (if the API supports creation)
-- Map YNAB frequency enum to Lunch Money's recurring cadence
+See **[scheduled-transactions-import-plan.md](scheduled-transactions-import-plan.md)** for the
+detailed plan. Summary:
+
+- Export YNAB scheduled transactions (already done — `data/<slug>/scheduled_transactions.json`)
+- **Blocking constraint:** LM v2 API has **no create endpoint** for recurring items (only `GET`).
+  The phase therefore emits a manual-entry **worklist** + relies on LM auto-detected suggestions,
+  rather than pushing via API.
+- Map YNAB frequency enum to LM's `granularity` × `quantity` cadence (see the plan's §4 table)
