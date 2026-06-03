@@ -20,6 +20,7 @@ from lm_api_types_generated import (
     PlaidAccountObject,
     CategoryObject,
     TransactionObject,
+    SplitTransactionObject,
 )
 
 BASE_URL = "https://api.lunchmoney.dev/v2"
@@ -152,11 +153,31 @@ class LMClient:
         skipped: list[Any] = []
         for i in range(0, len(transactions), BATCH_SIZE):
             batch = transactions[i:i + BATCH_SIZE]
-            body = {"transactions": [t.model_dump(exclude_none=True) for t in batch]}
+            body = {"transactions": [t.model_dump(mode="json", exclude_none=True) for t in batch]}
             resp = self._request("POST", "/transactions", body=body)
             inserted.extend([TransactionObject(**t) for t in resp.get("transactions", [])])
             skipped.extend(resp.get("skipped_duplicates", []))
         return InsertTransactionsResponseObject(transactions=inserted, skipped_duplicates=skipped)
+
+    def split_transaction(self, transaction_id: int,
+                          child_transactions: list[SplitTransactionObject]) -> TransactionObject:
+        """POST /transactions/split/{id} — split a parent into children."""
+        body = {"child_transactions": [c.model_dump(mode="json", exclude_none=True) for c in child_transactions]}
+        resp = self._request("POST", f"/transactions/split/{transaction_id}", body=body)
+        return TransactionObject(**resp)
+
+    def get_transaction(self, transaction_id: int, *,
+                        include_children: bool = False) -> TransactionObject:
+        params: dict[str, Any] = {}
+        if include_children:
+            params["include_split_parents"] = "true"
+            params["include_children"] = "true"
+        resp = self.get(f"/transactions/{transaction_id}", params=params or None)
+        return TransactionObject(**resp)
+
+    def update_transaction(self, transaction_id: int, data: dict[str, Any]) -> TransactionObject:
+        resp = self._request("PUT", f"/transactions/{transaction_id}", body=data)
+        return TransactionObject(**resp)
 
     def upsert_budget(self, start_date: str, category_id: int, amount: str, currency: str) -> dict[str, Any]:
         # Pass as dict since types don't match (pydantic coercion handles conversion)

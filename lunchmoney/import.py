@@ -7,12 +7,13 @@ Usage:
   ./test-run.sh ./lunchmoney/import.py --data data/cad audit          # strict YNAB-first audit
   ./test-run.sh ./lunchmoney/import.py --data data/cad import         # dry-run
   ./test-run.sh ./lunchmoney/import.py --data data/cad import --apply # apply
+  ./test-run.sh ./lunchmoney/import.py --data data/cad import --entities transactions --to-dir /tmp/out
 """
 import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -26,6 +27,8 @@ from lm_api_types_generated import CategoryObject, ChildCategoryObject, CreateCa
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping, MappingData, AccountMapping
 from sync_state import SyncState
+from transactions import TxnImportOptions, TransactionPlan, build_transaction_plan, preflight_check
+from sinks import ApiSink, DirSink, InsertResult, TransactionSink
 
 # Useful for some generic account handling functions:
 AnyCategory = CategoryObject | ChildCategoryObject
@@ -1230,6 +1233,11 @@ SPECIAL_LM_CATS: dict[str, dict] = {
         "exclude_from_budget": True,
         "exclude_from_totals": True,
     },
+    "incomplete_split": {
+        "name": "Incomplete Split",
+        "exclude_from_budget": True,
+        "exclude_from_totals": True,
+    },
 }
 
 
@@ -1381,7 +1389,7 @@ def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
         print(f"  Skip     {n_synced_g:3} already-synced group(s)")
         print(f"  Skip     {n_synced_c:3} already-synced categor(y/ies)")
     if n_sc_create:
-        print(f"  {verb} create  {n_sc_create:3} special LM categor(y/ies) (transfer/tracking)")
+        print(f"  {verb} create  {n_sc_create:3} special LM categor(y/ies)")
     if n_sc_recover:
         print(f"  {verb} recover {n_sc_recover:3} special LM categor(y/ies) into sync state")
     if n_sc_synced:
@@ -1410,7 +1418,7 @@ def _print_category_plan(plan: list[dict[str, Any]], apply: bool) -> None:
             print(f"        {item['name']}{flags}{rename}")
 
     if n_sc_create or n_sc_recover:
-        print(f"\n    {CYAN}Special categories (exclude from budget + totals){RESET}")
+        print(f"\n    {CYAN}Special categories{RESET}")
         for item in (i for i in plan if i["action"] in (_SC_CREATE, _SC_RECOVER)):
             verb2 = "create" if item["action"] == _SC_CREATE else "recover"
             print(f"      {verb2}  '{item['name']}'")
@@ -1565,20 +1573,144 @@ def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir
     return changes
 
 
+# ── import: transactions phase ────────────────────────────────────────────────
+
+def _print_transaction_plan(plan: TransactionPlan, apply: bool) -> None:
+    verb = "Will" if apply else "Would"
+    c = plan.counts
+
+    def _row(label: str, key: str) -> None:
+        n = c.get(key, 0)
+        if n:
+            print(f"  {verb} import  {n:5}  {label}")
+
+    def _skip(label: str, key: str) -> None:
+        n = c.get(key, 0)
+        if n:
+            print(f"  Skip     {n:5}  {label}")
+
+    _row("income (Inflow: Ready to Assign)", "income")
+    _row("spending (categorized)", "spending")
+    _row("uncategorized", "uncategorized")
+    _row("transfers (both legs migrated)", "transfer_paired")
+    _row("transfers (one leg only, other not migrated)", "transfer_one_sided")
+    _row("opening balances", "opening_balance")
+    _row("tracking (off-budget accounts)", "tracking")
+    _row("balance adjustments", "balance_adjustment")
+    _row("splits (native parents, pass 1)", "splits_native")
+    if c.get("split_children", 0):
+        print(f"  {verb} split   {c['split_children']:5}  split children (pass 2)")
+    _skip("zero-amount starting balances", "skipped_zero")
+    _skip("deleted transactions", "skipped_deleted")
+    _skip("transactions before --since", "skipped_before_since")
+
+    if plan.needs_decision:
+        print(f"\n  {RED}⚠ {len(plan.needs_decision):5}  need user decision (Deferred Income SubCategory){RESET}")
+        print(f"  {DIM}    Use --deferred-income-as {{income,uncategorized,skip}} to resolve.{RESET}")
+
+
+def phase_transactions(
+    data_dir: Path,
+    sink: TransactionSink,
+    sync: SyncState,
+    sync_dir: Path,
+    options: TxnImportOptions,
+    apply: bool,
+    on_missing: str = "abort",
+) -> int:
+    """Plan and optionally execute transaction import. Returns count of inserted transactions."""
+    ynab_txns: list[dict[str, Any]] = load_json(data_dir, "transactions")
+    ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
+
+    # Pre-flight
+    errors = preflight_check(ynab_txns, ynab_accounts, sync)
+    if errors:
+        if on_missing == "abort":
+            print(f"\n  {RED}Pre-flight failed:{RESET}")
+            for e in errors:
+                print(f"    {e}")
+            print(f"\n  {DIM}Fix the above issues and re-run.{RESET}")
+            sys.exit(1)
+        else:
+            for e in errors:
+                print(f"  {YELLOW}⚠{RESET}  {e}")
+
+    plan = build_transaction_plan(ynab_txns, ynab_accounts, sync=sync, options=options)
+    _print_transaction_plan(plan, apply)
+
+    if plan.needs_decision:
+        print(f"\n  {RED}Aborting: unresolved deferred income transactions.{RESET}")
+        sys.exit(1)
+
+    importable = [item for item in plan.items if item.insert is not None]
+    if not importable and not plan.split_requests:
+        print(f"\n  {GREEN}Nothing to import.{RESET}")
+        return 0
+
+    if not apply:
+        print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
+        return len(importable)
+
+    print()
+
+    # Pass 1: insert all transactions
+    to_insert = [item.insert for item in importable if item.insert is not None]
+    result = sink.insert(to_insert)
+    print(f"  {GREEN}✓{RESET} Pass 1: {result.inserted} inserted, {result.skipped} skipped as duplicates")
+
+    # Pass 2: split parents — find via LM (ApiSink) or internal tracking (DirSink)
+    split_done = split_already = 0
+    if plan.split_requests:
+        incomplete_split_cat_id = sync.special_cat_id("incomplete_split")
+        if incomplete_split_cat_id is None:
+            print(f"  {YELLOW}⚠{RESET}  'Incomplete Split' category not in sync_state — skipping pass 2")
+        else:
+            print(f"  Pass 2: looking up unsplit parents...")
+            lm_id_by_ynab = sink.unsplit_parents(plan.split_requests, incomplete_split_cat_id)
+            for req in plan.split_requests:
+                lm_id = lm_id_by_ynab.get(req.ynab_parent_id)
+                if lm_id is None:
+                    split_already += 1
+                    continue
+                sink.split(lm_id, req.child_transactions)
+                split_done += 1
+            print(f"  {GREEN}✓{RESET} Pass 2: {split_done} split(s) applied"
+                  + (f", {split_already} already split" if split_already else ""))
+
+    return result.inserted + split_done
+
+
 # ── import command ────────────────────────────────────────────────────────────
 
-VALID_ENTITIES = {"accounts", "categories"}
+VALID_ENTITIES = {"accounts", "categories", "transactions"}
 
 
-def cmd_import(data_dir: Path, client: LMClient, apply: bool,
+def cmd_import(data_dir: Path, client: LMClient | None, apply: bool,
                update_fields: list[str] | None = None,
                confirm_each: bool = False,
-               entities: set[str] | None = None) -> None:
+               entities: set[str] | None = None,
+               to_dir: Path | None = None,
+               txn_options: TxnImportOptions | None = None,
+               on_missing: str = "abort") -> None:
     meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
-    print("Fetching Lunch Money user info...")
-    me = client.get_me()
-    lm_account_id = me["account_id"]
+    if to_dir and not client:
+        # --to-dir mode: read lm_account_id from existing sync_state if possible
+        # or require the user to have run accounts/categories first
+        candidate_dirs = list(data_dir.glob("*/sync_state.json"))
+        if not candidate_dirs:
+            print("Error: no sync_state.json found under --data dir. "
+                  "Run 'import accounts' first, or provide a LUNCHMONEY_API_TOKEN.", file=sys.stderr)
+            sys.exit(1)
+        sync_dir = candidate_dirs[0].parent
+        lm_account_id = int(sync_dir.name)
+    else:
+        if client is None:
+            print("Error: LUNCHMONEY_API_TOKEN is required when not using --to-dir", file=sys.stderr)
+            sys.exit(1)
+        print("Fetching Lunch Money user info...")
+        me = client.get_me()
+        lm_account_id = me["account_id"]
 
     sync, sync_dir = SyncState.load_or_create(
         data_dir,
@@ -1595,29 +1727,47 @@ def cmd_import(data_dir: Path, client: LMClient, apply: bool,
     all_entities = entities is None
     totals: dict[str, int] = {}
 
-    if all_entities or "accounts" in entities:
-        print(BOLD + "── Accounts ──" + RESET)
-        totals["accounts"] = phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
-                                            update_fields=update_fields, confirm_each=confirm_each)
+    if all_entities or "accounts" in (entities or set()):
+        if client is None:
+            print(f"  {YELLOW}⚠{RESET}  Skipping accounts phase (no API token — use without --to-dir)")
+        else:
+            print(BOLD + "── Accounts ──" + RESET)
+            totals["accounts"] = phase_accounts(data_dir, client, sync, sync_dir, meta, apply,
+                                                update_fields=update_fields, confirm_each=confirm_each)
 
-    if all_entities or "categories" in entities:
-        print(BOLD + "\n── Categories ──" + RESET)
-        totals["categories"] = phase_categories(data_dir, client, sync, sync_dir, apply,
-                                                confirm_each=confirm_each)
+    if all_entities or "categories" in (entities or set()):
+        if client is None:
+            print(f"  {YELLOW}⚠{RESET}  Skipping categories phase (no API token — use without --to-dir)")
+        else:
+            print(BOLD + "\n── Categories ──" + RESET)
+            totals["categories"] = phase_categories(data_dir, client, sync, sync_dir, apply,
+                                                    confirm_each=confirm_each)
 
-    # Future phases (transactions) go here
-    # NOTE: transaction import requires all accounts and categories to be
-    # present in LM first. Before importing transactions, a status check is
-    # needed to verify that every YNAB account and category referenced by
-    # transactions has a corresponding LM entity. An option to control
-    # behavior on missing accounts/categories (skip, abort, create) will
-    # also be needed.
+    if all_entities or "transactions" in (entities or set()):
+        print(BOLD + "\n── Transactions ──" + RESET)
+        if to_dir:
+            sink: TransactionSink = DirSink(to_dir)
+        elif client is not None:
+            sink = ApiSink(client)
+        else:
+            print(f"  {YELLOW}⚠{RESET}  Skipping transactions phase (no sink configured)")
+            sink = None  # type: ignore[assignment]
+        if sink is not None:
+            try:
+                totals["transactions"] = phase_transactions(
+                    data_dir, sink, sync, sync_dir,
+                    options=txn_options or TxnImportOptions(),
+                    apply=apply,
+                    on_missing=on_missing,
+                )
+            finally:
+                sink.close()
 
     print(BOLD + f"\n── Summary ──" + RESET)
     total_changes = sum(totals.values())
     verb = "would change" if not apply else "changed"
     for entity, count in totals.items():
-        status = GREEN + f"{count} {verb}" + RESET if count else DIM + f"nothing to {verb.split()[0]}" + RESET
+        status = GREEN + f"{count} {verb}" + RESET if count else DIM + "nothing to do" + RESET
         print(f"  {entity:12} {status}")
     if not apply:
         print(f"\n{DIM}Run with --apply to execute the above changes.{RESET}\n")
@@ -1659,6 +1809,29 @@ def main() -> None:
             f"or 'all' (default). Valid values: {', '.join(sorted(VALID_ENTITIES))}"
         ),
     )
+    p_import.add_argument(
+        "--to-dir", metavar="DIR",
+        help="Write transaction output as JSON to DIR instead of the LM API (no token needed)",
+    )
+    p_import.add_argument(
+        "--since", metavar="DATE",
+        help="Only import transactions on or after DATE (YYYY-MM-DD). Opening balances are always included.",
+    )
+    p_import.add_argument(
+        "--opening-balance-category", metavar="CATEGORY_ID", type=int,
+        help="LM category ID to assign to imported opening balance transactions (default: none)",
+    )
+    p_import.add_argument(
+        "--deferred-income-as",
+        choices=["income", "uncategorized", "skip"],
+        help="How to handle 'Deferred Income SubCategory' transactions",
+    )
+    p_import.add_argument(
+        "--on-missing",
+        choices=["abort", "skip"],
+        default="abort",
+        help="Behaviour when a referenced account or category is missing from sync_state (default: abort)",
+    )
 
     args = parser.parse_args()
     data_dir = Path(args.data)
@@ -1672,14 +1845,27 @@ def main() -> None:
         return
 
     if args.cmd == "fix-mapping":
-        token = get_env("LUNCHMONEY_API_TOKEN")
-        cmd_fix_mapping(data_dir, LMClient(token))
+        fix_token = get_env("LUNCHMONEY_API_TOKEN")
+        cmd_fix_mapping(data_dir, LMClient(fix_token))
         return
 
-    token = get_env("LUNCHMONEY_API_TOKEN")
-    client = LMClient(token)
+    to_dir = Path(args.to_dir) if getattr(args, "to_dir", None) else None
+
+    # --to-dir doesn't require a token (unless also doing accounts/categories)
+    token_required = args.cmd != "import" or not to_dir or (
+        getattr(args, "entities", None) and
+        any(e in {"accounts", "categories"} for e in (args.entities or "").split(","))
+    )
+    token = os.environ.get("LUNCHMONEY_API_TOKEN")
+    if token_required and not token:
+        print("Error: LUNCHMONEY_API_TOKEN is not set", file=sys.stderr)
+        sys.exit(1)
+    client = LMClient(token) if token else None
 
     if args.cmd == "audit":
+        if not client:
+            print("Error: LUNCHMONEY_API_TOKEN is required for audit", file=sys.stderr)
+            sys.exit(1)
         print(f"Auditing Lunch Money against YNAB export in {data_dir}/\n")
         cmd_audit(data_dir, client)
 
@@ -1704,9 +1890,28 @@ def main() -> None:
                 print(f"Error: unknown entity type(s): {', '.join(sorted(unknown))}", file=sys.stderr)
                 print(f"Valid values: {', '.join(sorted(VALID_ENTITIES))}", file=sys.stderr)
                 sys.exit(1)
-        cmd_import(data_dir, client, apply=args.apply,
-                   update_fields=update_fields, confirm_each=args.confirm_each,
-                   entities=entities)
+
+        since: date | None = None
+        if getattr(args, "since", None):
+            try:
+                since = date.fromisoformat(args.since)
+            except ValueError:
+                print(f"Error: --since must be in YYYY-MM-DD format, got: {args.since}", file=sys.stderr)
+                sys.exit(1)
+
+        txn_options = TxnImportOptions(
+            since=since,
+            opening_balance_category=getattr(args, "opening_balance_category", None),
+            deferred_income_as=getattr(args, "deferred_income_as", None),
+        )
+
+        cmd_import(
+            data_dir, client, apply=args.apply,
+            update_fields=update_fields, confirm_each=args.confirm_each,
+            entities=entities, to_dir=to_dir,
+            txn_options=txn_options,
+            on_missing=getattr(args, "on_missing", "abort"),
+        )
 
 
 if __name__ == "__main__":
