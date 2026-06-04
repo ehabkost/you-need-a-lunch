@@ -414,6 +414,7 @@ class TxnUpdateItem:
     old_sub_ids: Optional[list[str]] = None
     new_ynab_hash: str = ""
     new_lm_hash: str = ""
+    no_baseline: bool = False   # True when both hashes were empty — change not detected, just applying YNAB
     note: str = ""
 
 
@@ -487,13 +488,11 @@ def build_transaction_update_plan(
         lm_changed   = stored_lm   != "" and stored_lm   != new_lm_hash
         both_unknown = stored_ynab == "" and stored_lm == ""
 
+        no_baseline = both_unknown
         if both_unknown:
-            items.append(TxnUpdateItem(
-                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                note="initialising hash baseline",
-            ))
-            continue
+            # No baseline: can't protect LM edits either way, so apply YNAB data.
+            ynab_changed = True
+            lm_changed = True
 
         if stored_ynab == "" and stored_lm != "":
             # Post-rebuild: lm_hash known, ynab_hash unknown
@@ -548,6 +547,7 @@ def build_transaction_update_plan(
                 ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_regular",
                 payload=insert_dict,
                 new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                no_baseline=no_baseline,
             ))
             continue
 
@@ -565,6 +565,7 @@ def build_transaction_update_plan(
                 ynab_sub_ids=[s["id"] for s in subs],
                 old_sub_ids=[],
                 new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                no_baseline=no_baseline,
                 note="no child map (post-rebuild) — unsplit+resplit",
             ))
             continue
@@ -578,6 +579,7 @@ def build_transaction_update_plan(
                 ynab_sub_ids=[s["id"] for s in subs],
                 old_sub_ids=list(known_sub_ids),
                 new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                no_baseline=no_baseline,
                 note="sub structure changed",
             ))
             continue
@@ -605,6 +607,7 @@ def build_transaction_update_plan(
             parent_payload=parent_payload,
             child_updates=child_updates,
             new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+            no_baseline=no_baseline,
         ))
 
     counts = {b: sum(1 for i in items if i.bucket == b) for b in UPDATE_BUCKETS}

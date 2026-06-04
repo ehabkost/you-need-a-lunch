@@ -1653,9 +1653,15 @@ def _apply_update_plan(
     c = update_plan.counts
     verb = "Will" if apply else "Would"
 
-    n_updates = c.get("update_regular", 0) + c.get("update_split_inplace", 0) + c.get("update_split_structural", 0)
-    if n_updates:
-        print(f"  {verb} update  {n_updates:5}  transaction(s) (YNAB changed, LM has stale data)")
+    _update_buckets = ("update_regular", "update_split_inplace", "update_split_structural")
+    n_detected = sum(1 for i in update_plan.items
+                     if i.bucket in _update_buckets and not i.no_baseline)
+    n_no_baseline = sum(1 for i in update_plan.items
+                        if i.bucket in _update_buckets and i.no_baseline)
+    if n_detected:
+        print(f"  {verb} update  {n_detected:5}  transaction(s) (YNAB changed since last import)")
+    if n_no_baseline:
+        print(f"  {verb} update  {n_no_baseline:5}  transaction(s) (no stored baseline — applying YNAB data)")
     if c.get("skipped_lm_edited", 0):
         print(f"  Skip     {c['skipped_lm_edited']:5}  transaction(s) (LM edited directly — not overwriting)")
     if c.get("conflict", 0):
@@ -1801,13 +1807,19 @@ def phase_transactions(
             ynab_txns, ynab_accounts, sync=sync, options=options
         )
         updates_applied = _apply_update_plan(update_plan, sink, sync, sync_dir, apply)
+        n_planned_updates = sum(update_plan.counts.get(b, 0) for b in
+                                ("update_regular", "update_split_inplace", "update_split_structural"))
     else:
         updates_applied = 0
+        n_planned_updates = 0
         print(f"  {DIM}No YNAB changes since last import (server_knowledge matches).{RESET}")
+
+    if not new_items and not pending_splits and n_planned_updates == 0:
+        print(f"\n  {GREEN}Nothing to do.{RESET}")
 
     if not apply:
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
-        return len(new_items)
+        return len(new_items) + n_planned_updates
 
     print()
 
@@ -1851,9 +1863,6 @@ def phase_transactions(
     if not skip_update_scan:
         sync.set_ynab_txn_server_knowledge(current_sk)
         sync.save(sync_dir)
-
-    if not new_items and not pending_splits and updates_applied == 0:
-        print(f"\n  {GREEN}Nothing to do.{RESET}")
 
     return result.inserted + split_done + updates_applied
 

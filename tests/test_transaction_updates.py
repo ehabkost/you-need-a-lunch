@@ -480,12 +480,12 @@ def test_split_structural_when_no_child_map():
     assert plan.items[0].note == "no child map (post-rebuild) — unsplit+resplit"
 
 
-def test_both_hashes_empty_initialises_baseline_no_update():
+def test_both_hashes_empty_applies_ynab_data():
+    # No baseline: can't protect LM edits, so apply YNAB data unconditionally.
     txn = make_ynab_txn()
     sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "lm_hash": ""}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "skipped_no_change"
-    assert "initialising hash baseline" in plan.items[0].note
+    assert plan.items[0].bucket == "update_regular"
     assert plan.items[0].new_ynab_hash != ""
     assert plan.items[0].new_lm_hash != ""
 
