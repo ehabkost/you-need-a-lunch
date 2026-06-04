@@ -159,6 +159,10 @@ class LMClient:
             skipped.extend(resp.get("skipped_duplicates", []))
         return InsertTransactionsResponseObject(transactions=inserted, skipped_duplicates=skipped)
 
+    def unsplit_transaction(self, transaction_id: int) -> None:
+        """DELETE /transactions/split/{id} — restores a split parent to a regular transaction."""
+        self._request("DELETE", f"/transactions/split/{transaction_id}")
+
     def split_transaction(self, transaction_id: int,
                           child_transactions: list[SplitTransactionObject]) -> TransactionObject:
         """POST /transactions/split/{id} — split a parent into children."""

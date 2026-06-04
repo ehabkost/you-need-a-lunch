@@ -26,8 +26,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lm_api_types_generated import CategoryObject, ChildCategoryObject, CreateCategoryRequestObject, ManualAccountObject, PlaidAccountObject, UpdateManualAccountRequestObject
 from lm_client import LMClient
 from mapping import MAPPING_FILE, Mapping, MappingData, AccountMapping
-from sync_state import SyncState
-from transactions import TxnImportOptions, TransactionPlan, build_transaction_plan, preflight_check
+from sync_state import SyncState, compute_ynab_hash
+from transactions import (
+    TxnImportOptions, TransactionPlan, build_transaction_plan, preflight_check,
+    TxnUpdateItem, TransactionUpdatePlan, build_transaction_update_plan, compute_insert_lm_hash,
+)
 from sinks import ApiSink, DirSink, InsertResult, TransactionSink
 
 # Useful for some generic account handling functions:
@@ -1625,10 +1628,103 @@ def _reconcile_txn_index(sink: TransactionSink, sync: SyncState, sync_dir: Path,
         print("  Building local transaction index from Lunch Money (first run)...")
     scanned = sink.scan_imported()
     for s in scanned:
-        sync.set_txn(s.ynab_id, lm_id=s.lm_id, split_done=s.split_done)
+        # ynab_hash intentionally left "" — we can't recover what YNAB looked like at import.
+        # lm_hash is populated from actual LM data so update detection works post-rebuild.
+        sync.set_txn(s.ynab_id, lm_id=s.lm_id, split_done=s.split_done, lm_hash=s.lm_hash)
+        for sub_ynab_id, child_lm_id in s.child_map.items():
+            sync.set_split_child(sub_ynab_id, child_lm_id)
     sync.set_txn_index_built(True)
     sync.save(sync_dir)
     print(f"  Indexed {len(scanned)} already-imported transaction(s).")
+    if force and any(s.ynab_id for s in scanned):
+        print(f"  {YELLOW}⚠{RESET}  One-way sync guarantee is suspended for this index: "
+              f"ynab_hash is empty after --rebuild-index. Review dry-run output carefully "
+              f"before --apply.")
+
+
+def _apply_update_plan(
+    update_plan: TransactionUpdatePlan,
+    sink: TransactionSink,
+    sync: SyncState,
+    sync_dir: Path,
+    apply: bool,
+) -> int:
+    """Print summary and optionally apply transaction updates. Returns count of updates applied."""
+    c = update_plan.counts
+    verb = "Will" if apply else "Would"
+
+    n_updates = c.get("update_regular", 0) + c.get("update_split_inplace", 0) + c.get("update_split_structural", 0)
+    if n_updates:
+        print(f"  {verb} update  {n_updates:5}  transaction(s) (YNAB changed, LM has stale data)")
+    if c.get("skipped_lm_edited", 0):
+        print(f"  Skip     {c['skipped_lm_edited']:5}  transaction(s) (LM edited directly — not overwriting)")
+    if c.get("conflict", 0):
+        print(f"  {YELLOW}Conflict {c['conflict']:5}  transaction(s) — both YNAB and LM changed{RESET}")
+    if update_plan.conflicts:
+        for item in update_plan.conflicts:
+            entry = sync.txn(item.ynab_id)
+            print(f"    {item.ynab_id[:8]}…  LM {entry.lm_id if entry else '?'}  — {item.note}")
+
+    if not apply:
+        return 0
+
+    applied = 0
+    for item in update_plan.items:
+        bucket = item.bucket
+        if bucket == "update_regular":
+            sink.update(item.lm_id, item.payload)
+            entry = sync.txn(item.ynab_id)
+            sync.set_txn(item.ynab_id, lm_id=item.lm_id,
+                         split_done=entry.split_done if entry else False,
+                         ynab_hash=item.new_ynab_hash, lm_hash=item.new_lm_hash)
+            applied += 1
+
+        elif bucket == "update_split_inplace":
+            sink.update(item.lm_id, item.parent_payload)
+            for child_lm_id, child_payload in (item.child_updates or []):
+                sink.update(child_lm_id, child_payload)
+            sync.set_txn(item.ynab_id, lm_id=item.lm_id, split_done=True,
+                         ynab_hash=item.new_ynab_hash, lm_hash=item.new_lm_hash)
+            applied += 1
+
+        elif bucket == "update_split_structural":
+            old_sub_ids = list(item.old_sub_ids or [])
+            sync.clear_split_children_for(old_sub_ids)
+            entry = sync.txn(item.ynab_id)
+            if entry:
+                entry.split_done = False
+                entry.synced_at = datetime.now(timezone.utc).isoformat()
+            sync.save(sync_dir)
+
+            try:
+                sink.unsplit(item.lm_id)
+            except Exception as e:
+                if "not a split parent" not in str(e).lower() and \
+                        "TRANSACTION_IS_NOT_SPLIT_PARENT" not in str(e):
+                    raise
+
+            if item.parent_payload:
+                sink.update(item.lm_id, item.parent_payload)
+
+            child_lm_ids = sink.split(item.lm_id, item.new_children or [])
+
+            new_child_map = dict(zip(item.ynab_sub_ids or [], child_lm_ids))
+            sync.mark_split_done(item.ynab_id, child_map=new_child_map)
+            sync.set_txn(item.ynab_id, lm_id=item.lm_id, split_done=True,
+                         ynab_hash=item.new_ynab_hash, lm_hash=item.new_lm_hash)
+            sync.save(sync_dir)
+            applied += 1
+
+        elif bucket in ("skipped_no_change", "skipped_ynab_unmapped"):
+            if item.new_ynab_hash or item.new_lm_hash:
+                entry = sync.txn(item.ynab_id)
+                if entry:
+                    sync.set_txn(item.ynab_id, lm_id=entry.lm_id,
+                                 split_done=entry.split_done,
+                                 ynab_hash=item.new_ynab_hash, lm_hash=item.new_lm_hash)
+
+    sync.save(sync_dir)
+    return applied
 
 
 def phase_transactions(
@@ -1658,10 +1754,20 @@ def phase_transactions(
             for e in errors:
                 print(f"  {YELLOW}⚠{RESET}  {e}")
 
+    # Load checkpoint for server_knowledge fast-path
+    checkpoint_path = data_dir / "checkpoint.json"
+    current_sk = 0
+    if checkpoint_path.exists():
+        import json as _json_ck
+        ck = _json_ck.loads(checkpoint_path.read_text())
+        current_sk = ck.get("transactions", 0)
+
     # Reconcile the local index from LM before planning so the dry-run is accurate
     # and apply doesn't re-send already-imported transactions.
     _reconcile_txn_index(sink, sync, sync_dir, force=rebuild_index)
     synced_ids = sync.synced_txn_ids()
+
+    skip_update_scan = (current_sk != 0 and current_sk == sync.ynab_txn_server_knowledge)
 
     plan = build_transaction_plan(ynab_txns, ynab_accounts, sync=sync, options=options)
 
@@ -1688,9 +1794,16 @@ def phase_transactions(
         print(f"\n  {RED}Aborting: unresolved deferred income transactions.{RESET}")
         sys.exit(1)
 
-    if not new_items and not pending_splits:
-        print(f"\n  {GREEN}Nothing to import — all transactions already in local index.{RESET}")
-        return 0
+    # Update scan runs in both dry-run and apply mode so the summary is always visible.
+    # _apply_update_plan handles apply=False by printing but not writing.
+    if not skip_update_scan:
+        update_plan = build_transaction_update_plan(
+            ynab_txns, ynab_accounts, sync=sync, options=options
+        )
+        updates_applied = _apply_update_plan(update_plan, sink, sync, sync_dir, apply)
+    else:
+        updates_applied = 0
+        print(f"  {DIM}No YNAB changes since last import (server_knowledge matches).{RESET}")
 
     if not apply:
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
@@ -1701,8 +1814,14 @@ def phase_transactions(
     # Pass 1: insert only transactions not already in the local index.
     to_insert = [item.insert for item in new_items if item.insert is not None]
     result = sink.insert(to_insert)
+    ynab_txn_by_id = {t["id"]: t for t in ynab_txns}
+    classified_by_id = {item.ynab_id: item for item in new_items}
     for ynab_id, lm_id in result.id_by_external.items():
-        sync.set_txn(ynab_id, lm_id=lm_id)
+        ynab_txn = ynab_txn_by_id.get(ynab_id)
+        c = classified_by_id.get(ynab_id)
+        yh = compute_ynab_hash(ynab_txn) if ynab_txn else ""
+        lh = compute_insert_lm_hash(c.insert, c.split_children) if (c and c.insert) else ""
+        sync.set_txn(ynab_id, lm_id=lm_id, ynab_hash=yh, lm_hash=lh)
     sync.save(sync_dir)
     print(f"  {GREEN}✓{RESET} Pass 1: {result.inserted} inserted, {result.skipped} skipped as duplicates")
 
@@ -1717,8 +1836,9 @@ def phase_transactions(
             if entry.split_done:
                 split_already += 1
                 continue
-            sink.split(entry.lm_id, req.child_transactions)
-            sync.mark_split_done(req.ynab_parent_id)
+            child_lm_ids = sink.split(entry.lm_id, req.child_transactions)
+            child_map = dict(zip(req.ynab_sub_ids, child_lm_ids))
+            sync.mark_split_done(req.ynab_parent_id, child_map=child_map)
             split_done += 1
         sync.save(sync_dir)
         extra = ""
@@ -1728,7 +1848,14 @@ def phase_transactions(
             extra += f", {YELLOW}{split_missing} parent(s) missing from index{RESET}"
         print(f"  {GREEN}✓{RESET} Pass 2: {split_done} split(s) applied{extra}")
 
-    return result.inserted + split_done
+    if not skip_update_scan:
+        sync.set_ynab_txn_server_knowledge(current_sk)
+        sync.save(sync_dir)
+
+    if not new_items and not pending_splits and updates_applied == 0:
+        print(f"\n  {GREEN}Nothing to do.{RESET}")
+
+    return result.inserted + split_done + updates_applied
 
 
 # ── import command ────────────────────────────────────────────────────────────
@@ -1891,6 +2018,10 @@ def main() -> None:
              "before importing (discards and re-scans). The index is built automatically "
              "on the first run; use this to force a refresh.",
     )
+    p_import.add_argument(
+        "--force-ynab", action="store_true",
+        help="When both YNAB and LM have changed (conflict), overwrite LM with YNAB data.",
+    )
 
     args = parser.parse_args()
     data_dir = Path(args.data)
@@ -1962,6 +2093,7 @@ def main() -> None:
             since=since,
             opening_balance_category=getattr(args, "opening_balance_category", None),
             deferred_income_as=getattr(args, "deferred_income_as", None),
+            force_ynab=getattr(args, "force_ynab", False),
         )
 
         cmd_import(

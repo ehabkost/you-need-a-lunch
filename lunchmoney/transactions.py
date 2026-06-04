@@ -43,6 +43,7 @@ class TxnImportOptions:
     since: Optional[date] = None
     opening_balance_category: Optional[int] = None
     deferred_income_as: Optional[str] = None   # "income" | "uncategorized" | "skip"
+    force_ynab: bool = False
 
 
 @dataclass
@@ -58,6 +59,7 @@ class ClassifiedTxn:
 class SplitRequest:
     ynab_parent_id: str
     child_transactions: list[SplitTransactionObject]
+    ynab_sub_ids: list[str] = field(default_factory=list)  # YNAB sub.id, same order as child_transactions
 
 
 @dataclass
@@ -315,9 +317,12 @@ def build_transaction_plan(
         classified = _classify_txn(txn, accts_by_id, sync, options)
         items.append(classified)
         if classified.split_children is not None:
+            non_deleted_subs = [s for s in (txn.get("subtransactions") or [])
+                                if not s.get("deleted")]
             split_requests.append(SplitRequest(
                 ynab_parent_id=classified.ynab_id,
                 child_transactions=classified.split_children,
+                ynab_sub_ids=[s["id"] for s in non_deleted_subs],
             ))
 
     counts: dict[str, int] = {b: 0 for b in BUCKETS}
@@ -380,3 +385,228 @@ def preflight_check(
                 seen_account_errors.add(account_id)
 
     return errors
+
+
+# ── Update plan types and builder ─────────────────────────────────────────────
+
+UPDATE_BUCKETS = (
+    "update_regular",
+    "update_split_inplace",
+    "update_split_structural",
+    "skipped_no_change",
+    "skipped_lm_edited",
+    "skipped_ynab_unmapped",
+    "skipped_split_no_children",
+    "conflict",
+)
+
+
+@dataclass
+class TxnUpdateItem:
+    ynab_id: str
+    lm_id: int
+    bucket: str
+    payload: Optional[dict[str, Any]] = None
+    parent_payload: Optional[dict[str, Any]] = None
+    child_updates: Optional[list[tuple[int, dict[str, Any]]]] = None
+    new_children: Optional[list[SplitTransactionObject]] = None
+    ynab_sub_ids: Optional[list[str]] = None
+    old_sub_ids: Optional[list[str]] = None
+    new_ynab_hash: str = ""
+    new_lm_hash: str = ""
+    note: str = ""
+
+
+@dataclass
+class TransactionUpdatePlan:
+    items: list[TxnUpdateItem]
+    counts: dict[str, int]
+    conflicts: list[TxnUpdateItem]
+
+
+def compute_insert_lm_hash(
+    insert: InsertTransactionObject,
+    split_children: Optional[list[SplitTransactionObject]] = None,
+) -> str:
+    """Compute lm_hash from the InsertTransactionObject that was (or will be) sent."""
+    from sync_state import compute_lm_hash
+    d = insert.model_dump(mode="json", exclude_none=False)
+    fields = {
+        "date": d.get("date"), "amount": d.get("amount"), "payee": d.get("payee"),
+        "category_id": d.get("category_id"), "notes": d.get("notes"),
+        "status": d.get("status"),
+    }
+    if split_children:
+        fields["split_children"] = [
+            {k: v for k, v in c.model_dump(mode="json").items()
+             if k in ("amount", "category_id", "notes", "payee")}
+            for c in split_children
+        ]
+    return compute_lm_hash(fields)
+
+
+def _parent_only_payload(insert: InsertTransactionObject) -> dict[str, Any]:
+    """PUT payload for the split parent (parent-level fields only, no account/currency)."""
+    d = insert.model_dump(mode="json", exclude_none=True)
+    for k in ("external_id", "manual_account_id", "plaid_account_id", "currency"):
+        d.pop(k, None)
+    return d
+
+
+def build_transaction_update_plan(
+    ynab_txns: list[dict[str, Any]],
+    ynab_accounts: list[dict[str, Any]],
+    *,
+    sync: SyncState,
+    options: TxnImportOptions,
+) -> TransactionUpdatePlan:
+    """Pure. For each YNAB txn already in sync.transactions, decide whether an LM update
+    is needed and what kind. No I/O."""
+    from sync_state import compute_ynab_hash
+    accts_by_id = {a["id"]: a for a in ynab_accounts}
+    items: list[TxnUpdateItem] = []
+
+    for txn in ynab_txns:
+        ynab_id = txn["id"]
+        entry = sync.txn(ynab_id)
+        if entry is None:
+            continue
+        if txn.get("deleted"):
+            continue
+
+        current_ynab_hash = compute_ynab_hash(txn)
+        classified = _classify_txn(txn, accts_by_id, sync, options)
+        if classified.insert is None:
+            continue
+
+        new_lm_hash = compute_insert_lm_hash(classified.insert, classified.split_children)
+        stored_ynab = entry.ynab_hash
+        stored_lm   = entry.lm_hash
+
+        ynab_changed = stored_ynab != "" and stored_ynab != current_ynab_hash
+        lm_changed   = stored_lm   != "" and stored_lm   != new_lm_hash
+        both_unknown = stored_ynab == "" and stored_lm == ""
+
+        if both_unknown:
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="initialising hash baseline",
+            ))
+            continue
+
+        if stored_ynab == "" and stored_lm != "":
+            # Post-rebuild: lm_hash known, ynab_hash unknown
+            if not lm_changed:
+                items.append(TxnUpdateItem(
+                    ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
+                    new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                ))
+                continue
+            # lm_hash changed — treat as YNAB change (one-way sync guarantee suspended post-rebuild)
+            ynab_changed = True
+
+        if not ynab_changed and not lm_changed:
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+            ))
+            continue
+
+        if not ynab_changed and lm_changed:
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_lm_edited",
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="LM was edited directly — not overwriting",
+            ))
+            continue
+
+        if ynab_changed and not lm_changed:
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_ynab_unmapped",
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="YNAB changed in a field we don't map to LM",
+            ))
+            continue
+
+        # Both changed
+        if stored_ynab != "" and stored_lm != "" and not options.force_ynab:
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="conflict",
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="both YNAB and LM changed since last import",
+            ))
+            continue
+
+        is_split = classified.split_children is not None
+
+        if not is_split:
+            insert_dict = classified.insert.model_dump(mode="json", exclude_none=True)
+            for k in ("external_id", "manual_account_id", "plaid_account_id", "currency"):
+                insert_dict.pop(k, None)
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_regular",
+                payload=insert_dict,
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+            ))
+            continue
+
+        subs = [s for s in (txn.get("subtransactions") or []) if not s.get("deleted")]
+        current_sub_ids = {s["id"] for s in subs}
+        known_sub_ids = {sid for sid in current_sub_ids
+                         if sync.split_child_lm_id(sid) is not None}
+
+        if not known_sub_ids:
+            parent_payload = _parent_only_payload(classified.insert)
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_split_structural",
+                parent_payload=parent_payload,
+                new_children=classified.split_children,
+                ynab_sub_ids=[s["id"] for s in subs],
+                old_sub_ids=[],
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="no child map (post-rebuild) — unsplit+resplit",
+            ))
+            continue
+
+        if current_sub_ids != known_sub_ids:
+            parent_payload = _parent_only_payload(classified.insert)
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_split_structural",
+                parent_payload=parent_payload,
+                new_children=classified.split_children,
+                ynab_sub_ids=[s["id"] for s in subs],
+                old_sub_ids=list(known_sub_ids),
+                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                note="sub structure changed",
+            ))
+            continue
+
+        # Non-structural: per-child updates
+        child_updates: list[tuple[int, dict[str, Any]]] = []
+        for sub, lm_child in zip(subs, classified.split_children or []):
+            child_lm_id = sync.split_child_lm_id(sub["id"])
+            if child_lm_id is None:
+                continue
+            child_payload: dict[str, Any] = {
+                "amount": lm_child.amount,
+                "category_id": lm_child.category_id,
+                "notes": lm_child.notes,
+                "payee": lm_child.payee,
+            }
+            if lm_child.date:
+                child_payload["date"] = lm_child.date.isoformat()
+            child_payload = {k: v for k, v in child_payload.items() if v is not None}
+            child_updates.append((child_lm_id, child_payload))
+
+        parent_payload = _parent_only_payload(classified.insert)
+        items.append(TxnUpdateItem(
+            ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_split_inplace",
+            parent_payload=parent_payload,
+            child_updates=child_updates,
+            new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+        ))
+
+    counts = {b: sum(1 for i in items if i.bucket == b) for b in UPDATE_BUCKETS}
+    conflicts = [i for i in items if i.bucket == "conflict"]
+    return TransactionUpdatePlan(items=items, counts=counts, conflicts=conflicts)

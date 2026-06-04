@@ -36,7 +36,9 @@ Schema:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import json as _json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -78,6 +80,8 @@ class TxnEntry(BaseModel):
     model_config = ConfigDict(extra="allow")
     lm_id: int
     split_done: bool = False           # split parents only: True once pass-2 split applied
+    ynab_hash: str = ""                # hash of YNAB input fields at last import
+    lm_hash: str = ""                  # hash of LM payload fields at last import
     synced_at: str = ""
 
 
@@ -107,6 +111,11 @@ class SyncStateData(BaseModel):
     transactions: dict[str, TxnEntry] = Field(default_factory=dict)
     # True once the LM-side transaction index has been built/reconciled at least once.
     txn_index_built: bool = False
+    # YNAB sub.id -> LM child transaction id. Keyed by sub ID (not parent).
+    # Populated during Pass 2 split. Used for per-child updates.
+    split_children: dict[str, int] = Field(default_factory=dict)
+    # checkpoint["transactions"] value at last successful --apply run.
+    ynab_txn_server_knowledge: int = 0
 
 
 class SyncState:
@@ -190,16 +199,39 @@ class SyncState:
     def txn(self, ynab_id: str) -> Optional[TxnEntry]:
         return self._d.transactions.get(ynab_id)
 
-    def set_txn(self, ynab_id: str, *, lm_id: int, split_done: bool = False) -> None:
+    def set_txn(self, ynab_id: str, *, lm_id: int, split_done: bool = False,
+                ynab_hash: str = "", lm_hash: str = "") -> None:
         self._d.transactions[ynab_id] = TxnEntry(
-            lm_id=lm_id, split_done=split_done, synced_at=_now(),
+            lm_id=lm_id, split_done=split_done,
+            ynab_hash=ynab_hash, lm_hash=lm_hash, synced_at=_now(),
         )
 
-    def mark_split_done(self, ynab_id: str) -> None:
+    def mark_split_done(self, ynab_id: str,
+                        child_map: Optional[dict[str, int]] = None) -> None:
         e = self._d.transactions.get(ynab_id)
         if e:
             e.split_done = True
             e.synced_at = _now()
+        if child_map:
+            self._d.split_children.update(child_map)
+
+    def split_child_lm_id(self, ynab_sub_id: str) -> Optional[int]:
+        return self._d.split_children.get(ynab_sub_id)
+
+    def set_split_child(self, ynab_sub_id: str, lm_child_id: int) -> None:
+        self._d.split_children[ynab_sub_id] = lm_child_id
+
+    def clear_split_children_for(self, ynab_sub_ids: list[str]) -> None:
+        """Remove stale child entries when a split is being redone."""
+        for sid in ynab_sub_ids:
+            self._d.split_children.pop(sid, None)
+
+    @property
+    def ynab_txn_server_knowledge(self) -> int:
+        return self._d.ynab_txn_server_knowledge
+
+    def set_ynab_txn_server_knowledge(self, value: int) -> None:
+        self._d.ynab_txn_server_knowledge = value
 
     def synced_txn_ids(self) -> set[str]:
         return set(self._d.transactions.keys())
@@ -233,3 +265,55 @@ class SyncState:
     def lm_category_group_id(self, ynab_id: str) -> Optional[int]:
         e = self.category_group(ynab_id)
         return e.lm_id if e else None
+
+
+# ── Hash functions (module-level, no I/O) ─────────────────────────────────────
+
+def compute_ynab_hash(txn: dict) -> str:
+    """Hash the YNAB fields that drive the LM payload."""
+    key: dict = {
+        "date":        txn["date"],
+        "amount":      txn["amount"],
+        "category_id": txn.get("category_id"),
+        "payee_name":  txn.get("payee_name"),
+        "memo":        txn.get("memo"),
+        "approved":    txn.get("approved"),
+        "flag_color":  txn.get("flag_color"),
+    }
+    subs = [s for s in (txn.get("subtransactions") or []) if not s.get("deleted")]
+    if subs:
+        key["subtransactions"] = sorted(
+            [{"amount": s["amount"], "category_id": s.get("category_id"),
+              "payee_name": s.get("payee_name"), "memo": s.get("memo")}
+             for s in subs],
+            key=lambda s: _json.dumps(s, sort_keys=True),
+        )
+    return hashlib.sha256(_json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def compute_lm_hash(fields: dict) -> str:
+    """Hash the LM payload fields that are written / compared.
+
+    *fields* must be a plain dict with string keys. Pass either:
+    - insert.model_dump(mode="json", exclude_none=False) at import time, or
+    - a dict extracted from TransactionObject at rebuild time.
+    Date must be an ISO string ("YYYY-MM-DD") in both cases.
+    For split parents, include "split_children" key (see below).
+    """
+    key = {
+        "date":        fields.get("date"),
+        "amount":      fields.get("amount"),
+        "payee":       fields.get("payee"),
+        "category_id": fields.get("category_id"),
+        "notes":       fields.get("notes"),
+        "status":      fields.get("status"),
+    }
+    children = fields.get("split_children")
+    if children:
+        key["split_children"] = sorted(
+            [{"amount": c.get("amount"), "category_id": c.get("category_id"),
+              "notes": c.get("notes"), "payee": c.get("payee")}
+             for c in children],
+            key=lambda c: _json.dumps(c, sort_keys=True),
+        )
+    return hashlib.sha256(_json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]

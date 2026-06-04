@@ -16,6 +16,8 @@ class ScannedTxn:
     ynab_id: str
     lm_id: int
     split_done: bool = False
+    lm_hash: str = ""
+    child_map: dict[str, int] = field(default_factory=dict)  # sub_ynab_id -> child_lm_id
 
 
 @dataclass
@@ -31,7 +33,9 @@ class TransactionSink(Protocol):
         """Return all transactions already imported by this tool (ynab_id ↔ lm_id pairs)."""
         ...
     def insert(self, txns: list[InsertTransactionObject]) -> InsertResult: ...
-    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> None: ...
+    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> list[int]: ...
+    def unsplit(self, parent_lm_id: int) -> None: ...
+    def update(self, lm_id: int, payload: dict[str, Any]) -> None: ...
     def close(self) -> None: ...
 
 
@@ -48,19 +52,33 @@ class ApiSink:
         scan (they're flagged is_split_parent), so no per-parent lookups are needed.
         Split children carry no ynab_id and are ignored.
         """
+        from sync_state import compute_lm_hash
         txns = self._client.get_transactions(
             start_date="1900-01-01", end_date="2100-01-01",
             include_split_parents="true",
+            include_children="true",
         )
         result: list[ScannedTxn] = []
         for t in txns:
             ynab_id = (t.custom_metadata or {}).get("ynab_id")
             if not ynab_id:
                 continue
-            # A split parent that has already been split is flagged is_split_parent;
-            # an unsplit parent still looks like a normal txn (split_done stays False).
+            date_str = t.date.isoformat() if hasattr(t.date, "isoformat") else str(t.date)
+            fields: dict[str, Any] = {
+                "date": date_str, "amount": t.amount, "payee": t.payee,
+                "category_id": t.category_id, "notes": t.notes,
+                "status": t.status.value if hasattr(t.status, "value") else t.status,
+            }
+            if t.is_split_parent and t.children:
+                fields["split_children"] = [
+                    {"amount": c.amount, "category_id": c.category_id,
+                     "notes": c.notes, "payee": c.payee}
+                    for c in t.children
+                ]
+            lm_hash = compute_lm_hash(fields)
             result.append(ScannedTxn(ynab_id=str(ynab_id), lm_id=t.id,
-                                     split_done=bool(t.is_split_parent)))
+                                     split_done=bool(t.is_split_parent),
+                                     lm_hash=lm_hash))
         return result
 
     def insert(self, txns: list[InsertTransactionObject]) -> InsertResult:
@@ -86,8 +104,15 @@ class ApiSink:
             id_by_external=id_by_external,
         )
 
-    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> None:
-        self._client.split_transaction(parent_lm_id, children)
+    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> list[int]:
+        result = self._client.split_transaction(parent_lm_id, children)
+        return [c.id for c in (result.children or [])]
+
+    def unsplit(self, parent_lm_id: int) -> None:
+        self._client.unsplit_transaction(parent_lm_id)
+
+    def update(self, lm_id: int, payload: dict[str, Any]) -> None:
+        self._client.update_transaction(lm_id, payload)
 
     def close(self) -> None:
         pass
@@ -101,6 +126,8 @@ class DirSink:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._txns: list[dict[str, Any]] = []
         self._splits: list[dict[str, Any]] = []
+        self._unsplits: list[dict[str, Any]] = []
+        self._updates: list[dict[str, Any]] = []
         self._next_id = 1
 
     def scan_imported(self) -> list[ScannedTxn]:
@@ -119,14 +146,27 @@ class DirSink:
         return InsertResult(inserted=len(txns), skipped=0, skipped_reasons={},
                             id_by_external=id_by_external)
 
-    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> None:
+    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> list[int]:
+        child_ids = [self._next_id + i for i in range(len(children))]
+        self._next_id += len(children)
         self._splits.append({
             "parent_lm_id": parent_lm_id,
             "child_transactions": [c.model_dump(mode="json", exclude_none=True) for c in children],
         })
+        return child_ids
+
+    def unsplit(self, parent_lm_id: int) -> None:
+        self._unsplits.append({"parent_lm_id": parent_lm_id})
+
+    def update(self, lm_id: int, payload: dict[str, Any]) -> None:
+        self._updates.append({"lm_id": lm_id, "payload": payload})
 
     def close(self) -> None:
         txns_sorted = sorted(self._txns, key=lambda t: t.get("external_id", ""))
         splits_sorted = sorted(self._splits, key=lambda s: s["parent_lm_id"])
+        unsplits_sorted = sorted(self._unsplits, key=lambda s: s["parent_lm_id"])
+        updates_sorted = sorted(self._updates, key=lambda u: u["lm_id"])
         (self._dir / "transactions.json").write_text(json.dumps(txns_sorted, indent=2))
         (self._dir / "split_pass.json").write_text(json.dumps(splits_sorted, indent=2))
+        (self._dir / "unsplit_pass.json").write_text(json.dumps(unsplits_sorted, indent=2))
+        (self._dir / "updates.json").write_text(json.dumps(updates_sorted, indent=2))
