@@ -1575,9 +1575,10 @@ def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir
 
 # ── import: transactions phase ────────────────────────────────────────────────
 
-def _print_transaction_plan(plan: TransactionPlan, apply: bool) -> None:
+def _print_transaction_plan(c: dict[str, int], needs_decision: list[Any],
+                            already_synced: int, apply: bool) -> None:
+    """Print the transaction plan. *c* holds counts for the NEW (not-yet-imported) txns."""
     verb = "Will" if apply else "Would"
-    c = plan.counts
 
     def _row(label: str, key: str) -> None:
         n = c.get(key, 0)
@@ -1600,13 +1601,34 @@ def _print_transaction_plan(plan: TransactionPlan, apply: bool) -> None:
     _row("splits (native parents, pass 1)", "splits_native")
     if c.get("split_children", 0):
         print(f"  {verb} split   {c['split_children']:5}  split children (pass 2)")
+    if already_synced:
+        print(f"  Skip     {already_synced:5}  already imported (in local index)")
     _skip("zero-amount starting balances", "skipped_zero")
     _skip("deleted transactions", "skipped_deleted")
     _skip("transactions before --since", "skipped_before_since")
 
-    if plan.needs_decision:
-        print(f"\n  {RED}⚠ {len(plan.needs_decision):5}  need user decision (Deferred Income SubCategory){RESET}")
+    if needs_decision:
+        print(f"\n  {RED}⚠ {len(needs_decision):5}  need user decision (Deferred Income SubCategory){RESET}")
         print(f"  {DIM}    Use --deferred-income-as {{income,uncategorized,skip}} to resolve.{RESET}")
+
+
+def _reconcile_txn_index(sink: TransactionSink, sync: SyncState, sync_dir: Path,
+                         *, force: bool) -> None:
+    """Build/refresh the local ynab_id↔lm_id index from LM so already-imported
+    transactions are skipped instead of re-POSTed. Read-only against LM."""
+    if not force and sync.txn_index_built:
+        return
+    if force:
+        print("  Rebuilding local transaction index from Lunch Money (--rebuild-index)...")
+        sync.clear_transactions()
+    else:
+        print("  Building local transaction index from Lunch Money (first run)...")
+    scanned = sink.scan_imported()
+    for s in scanned:
+        sync.set_txn(s.ynab_id, lm_id=s.lm_id, split_done=s.split_done)
+    sync.set_txn_index_built(True)
+    sync.save(sync_dir)
+    print(f"  Indexed {len(scanned)} already-imported transaction(s).")
 
 
 def phase_transactions(
@@ -1617,6 +1639,7 @@ def phase_transactions(
     options: TxnImportOptions,
     apply: bool,
     on_missing: str = "abort",
+    rebuild_index: bool = False,
 ) -> int:
     """Plan and optionally execute transaction import. Returns count of inserted transactions."""
     ynab_txns: list[dict[str, Any]] = load_json(data_dir, "transactions")
@@ -1635,47 +1658,75 @@ def phase_transactions(
             for e in errors:
                 print(f"  {YELLOW}⚠{RESET}  {e}")
 
+    # Reconcile the local index from LM before planning so the dry-run is accurate
+    # and apply doesn't re-send already-imported transactions.
+    _reconcile_txn_index(sink, sync, sync_dir, force=rebuild_index)
+    synced_ids = sync.synced_txn_ids()
+
     plan = build_transaction_plan(ynab_txns, ynab_accounts, sync=sync, options=options)
-    _print_transaction_plan(plan, apply)
+
+    importable = [item for item in plan.items if item.insert is not None]
+    new_items = [item for item in importable if item.ynab_id not in synced_ids]
+    already_synced = len(importable) - len(new_items)
+
+    # Split parents that still need a pass-2 split (never split, or inserted-but-not-split).
+    pending_splits = [
+        sr for sr in plan.split_requests
+        if (e := sync.txn(sr.ynab_parent_id)) is None or not e.split_done
+    ]
+
+    # Counts for NEW work only (the dry-run summary).
+    counts: dict[str, int] = {b: 0 for b in plan.counts if b != "split_children"}
+    for item in new_items:
+        if item.bucket in counts:
+            counts[item.bucket] += 1
+    counts["split_children"] = sum(len(sr.child_transactions) for sr in pending_splits)
+
+    _print_transaction_plan(counts, plan.needs_decision, already_synced, apply)
 
     if plan.needs_decision:
         print(f"\n  {RED}Aborting: unresolved deferred income transactions.{RESET}")
         sys.exit(1)
 
-    importable = [item for item in plan.items if item.insert is not None]
-    if not importable and not plan.split_requests:
-        print(f"\n  {GREEN}Nothing to import.{RESET}")
+    if not new_items and not pending_splits:
+        print(f"\n  {GREEN}Nothing to import — all transactions already in local index.{RESET}")
         return 0
 
     if not apply:
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
-        return len(importable)
+        return len(new_items)
 
     print()
 
-    # Pass 1: insert all transactions
-    to_insert = [item.insert for item in importable if item.insert is not None]
+    # Pass 1: insert only transactions not already in the local index.
+    to_insert = [item.insert for item in new_items if item.insert is not None]
     result = sink.insert(to_insert)
+    for ynab_id, lm_id in result.id_by_external.items():
+        sync.set_txn(ynab_id, lm_id=lm_id)
+    sync.save(sync_dir)
     print(f"  {GREEN}✓{RESET} Pass 1: {result.inserted} inserted, {result.skipped} skipped as duplicates")
 
-    # Pass 2: split parents — find via LM (ApiSink) or internal tracking (DirSink)
-    split_done = split_already = 0
+    # Pass 2: split parents using the local index (lm_id recorded above / pre-existing).
+    split_done = split_already = split_missing = 0
     if plan.split_requests:
-        incomplete_split_cat_id = sync.special_cat_id("incomplete_split")
-        if incomplete_split_cat_id is None:
-            print(f"  {YELLOW}⚠{RESET}  'Incomplete Split' category not in sync_state — skipping pass 2")
-        else:
-            print(f"  Pass 2: looking up unsplit parents...")
-            lm_id_by_ynab = sink.unsplit_parents(plan.split_requests, incomplete_split_cat_id)
-            for req in plan.split_requests:
-                lm_id = lm_id_by_ynab.get(req.ynab_parent_id)
-                if lm_id is None:
-                    split_already += 1
-                    continue
-                sink.split(lm_id, req.child_transactions)
-                split_done += 1
-            print(f"  {GREEN}✓{RESET} Pass 2: {split_done} split(s) applied"
-                  + (f", {split_already} already split" if split_already else ""))
+        for req in plan.split_requests:
+            entry = sync.txn(req.ynab_parent_id)
+            if entry is None:
+                split_missing += 1
+                continue
+            if entry.split_done:
+                split_already += 1
+                continue
+            sink.split(entry.lm_id, req.child_transactions)
+            sync.mark_split_done(req.ynab_parent_id)
+            split_done += 1
+        sync.save(sync_dir)
+        extra = ""
+        if split_already:
+            extra += f", {split_already} already split"
+        if split_missing:
+            extra += f", {YELLOW}{split_missing} parent(s) missing from index{RESET}"
+        print(f"  {GREEN}✓{RESET} Pass 2: {split_done} split(s) applied{extra}")
 
     return result.inserted + split_done
 
@@ -1691,7 +1742,8 @@ def cmd_import(data_dir: Path, client: LMClient | None, apply: bool,
                entities: set[str] | None = None,
                to_dir: Path | None = None,
                txn_options: TxnImportOptions | None = None,
-               on_missing: str = "abort") -> None:
+               on_missing: str = "abort",
+               rebuild_index: bool = False) -> None:
     meta: dict[str, Any] = load_json(data_dir, "export_metadata")
 
     if to_dir and not client:
@@ -1759,6 +1811,7 @@ def cmd_import(data_dir: Path, client: LMClient | None, apply: bool,
                     options=txn_options or TxnImportOptions(),
                     apply=apply,
                     on_missing=on_missing,
+                    rebuild_index=rebuild_index,
                 )
             finally:
                 sink.close()
@@ -1831,6 +1884,12 @@ def main() -> None:
         choices=["abort", "skip"],
         default="abort",
         help="Behaviour when a referenced account or category is missing from sync_state (default: abort)",
+    )
+    p_import.add_argument(
+        "--rebuild-index", action="store_true",
+        help="Rebuild the local already-imported transaction index from Lunch Money "
+             "before importing (discards and re-scans). The index is built automatically "
+             "on the first run; use this to force a refresh.",
     )
 
     args = parser.parse_args()
@@ -1911,6 +1970,7 @@ def main() -> None:
             entities=entities, to_dir=to_dir,
             txn_options=txn_options,
             on_missing=getattr(args, "on_missing", "abort"),
+            rebuild_index=getattr(args, "rebuild_index", False),
         )
 
 

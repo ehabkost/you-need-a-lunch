@@ -279,53 +279,70 @@ Behaviour on violation is controlled by `--on-missing {abort,skip,create}` (defa
 
 ## 7. Dedup & crash resistance
 
-- **Manual accounts**: set `external_id = <ynab txn id>`. LM rejects a duplicate `external_id`
-  on the same manual account and reports it under `skipped_duplicates` with
-  `Reason.duplicate_external_id`. So re-runs are safe with **zero pre-fetch**. The sink just
-  reports the skip counts.
-- **Writable Plaid accounts** (rare): `external_id` uniqueness isn't enforced there, so the
-  ApiSink pre-fetches existing transactions for that account and filters by
-  `custom_metadata.ynab_id`. `existing_ynab_ids()` on the sink abstracts this.
-- Transaction IDs are **not** recorded in `sync_state.json` (would bloat it to 10k+ entries);
-  dedup relies on `external_id` + `custom_metadata.ynab_id` living on the LM side. (If a future
-  tool needs the mapping, derive it by reading LM transactions back.)
-- **Split exception:** split **parents** dedup normally via `external_id` (§4.2 Pass 1). Split
-  **children** have **no** `external_id` or `custom_metadata` (LM schema forbids it — §4.1), so
-  they cannot be deduped on the LM side. They are therefore the **one** thing recorded in
-  `sync_state`: `split_parents[ynab_parent_id] = {lm_id, split_done}` and
-  `split_children[ynab_sub_id] = lm_child_id`. This is bounded by the split count (~351 in
-  `data/cad`), not the full transaction count, so it does not bloat the file. Pass 2 is gated on
-  `split_done`, making the split idempotent across re-runs.
+The importer keeps a **local index** of every imported transaction in `sync_state.json`
+(`transactions[ynab_id] = {lm_id, split_done}`). This is the dedup key — without it, every
+run re-POSTed all ~12k transactions to LM and leaned on the server to reject them as
+duplicates, which abuses the API and makes dry-runs lie ("would import 12068").
+
+- **Building the index.** Before planning, `phase_transactions` calls
+  `_reconcile_txn_index()`. If the index has never been built (`txn_index_built == False`)
+  it scans LM once (`sink.scan_imported()`) and records every `ynab_id ↔ lm_id` pair found
+  via `custom_metadata.ynab_id`. This is read-only, runs in dry-run too, and migrates an
+  account that was imported before the index existed. `--rebuild-index` forces a discard +
+  re-scan (`sync.clear_transactions()` then rebuild).
+- **Planning.** `build_transaction_plan` stays pure; the phase then partitions importable
+  items into *new* (`ynab_id not in synced_ids`) vs *already imported*, and the dry-run
+  counts/summary reflect **only the new work**. Already-imported txns show under
+  "Skip … already imported (in local index)".
+- **Applying.** Pass 1 inserts only the new items. The insert result returns
+  `id_by_external` (`ynab_id → lm_id`, populated from inserted txns *and* from any
+  `skipped_duplicates` via `existing_transaction_id` — self-healing if the index was
+  incomplete); those pairs are written to the index immediately. `external_id =
+  <ynab txn id>` on manual accounts remains a second line of defense.
+- **Split parents** dedup via the index like any other txn (Pass 1). Their `split_done`
+  flag gates Pass 2 so the split is idempotent. `scan_imported()` recovers already-split
+  parents in the same scan via `include_split_parents=true` (they come back flagged
+  `is_split_parent`, which sets `split_done`). Split **children** carry no `external_id` /
+  `custom_metadata` (LM schema forbids it — §4.1) and are never indexed directly; they're
+  reconstructed from the parent on each run.
+- **Crash window.** The index is saved after Pass 1 and after Pass 2. If a crash lands
+  between a `split()` call and the save, `split_done` is stale; `--rebuild-index` reconciles
+  it (the parent comes back `is_split_parent`).
 
 ## 8. The sink abstraction (`sinks.py`)
 
 ```python
 @dataclass
+class ScannedTxn:                          # one already-imported txn discovered on LM
+    ynab_id: str
+    lm_id: int
+    split_done: bool = False
+
+@dataclass
 class InsertResult:
     inserted: int
     skipped: int
-    skipped_reasons: dict[str, int]   # Reason -> count (API); {} for DirSink
+    skipped_reasons: dict[str, int]        # Reason -> count (API); {} for DirSink
+    id_by_external: dict[str, int]         # ynab_id -> LM txn id (for the local index)
 
 class TransactionSink(Protocol):
-    def existing_ynab_ids(self, *, manual_account_id: int | None,
-                          plaid_account_id: int | None) -> set[str]: ...
+    def scan_imported(self) -> list[ScannedTxn]: ...   # rebuild the index from LM
     def insert(self, txns: list[InsertTransactionObject]) -> InsertResult: ...
-    # Pass 2 of native splits (§4.2): split an already-inserted parent into children.
-    # Returns the child LM ids in the same order as `children`, so the caller can record
-    # sync_state.split_children[sub.id] = child_lm_id.
-    def split(self, parent_lm_id: int,
-              children: list[SplitTransactionObject]) -> list[int]: ...
+    def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> None: ...
     def close(self) -> None: ...
 ```
 
+Pass 2 no longer asks the sink to locate unsplit parents — the caller drives splits from the
+local index (`sync.txn(parent).lm_id`, gated on `split_done`).
+
 ### `ApiSink`
 
-Wraps `LMClient`. `insert()` delegates to `client.insert_transactions()` (already batches by
-500 and aggregates `skipped_duplicates`). `existing_ynab_ids()` returns `set()` for manual
-accounts (external_id handles it) and the real set for writable Plaid. `split()` calls
-`client.split_transaction()` (§4.4) and returns the children's LM ids; it treats LM's
-*"cannot split an already split transaction"* `400` as success and recovers the existing child
-ids (§4.2 re-run handling).
+Wraps `LMClient`. `scan_imported()` does one paginated `GET /transactions`
+(`include_split_parents=true`, `include_metadata=true`) and returns a `ScannedTxn` per txn
+carrying `custom_metadata.ynab_id`. `insert()` delegates to `client.insert_transactions()`
+(batches by 500, aggregates `skipped_duplicates`) and builds `id_by_external` from the
+inserted txns plus any skipped duplicates' `existing_transaction_id`. `split()` calls
+`client.split_transaction()` (§4.4).
 
 ### `DirSink`
 
@@ -335,15 +352,14 @@ Writes LM-format JSON to `--to-dir DIR`, **no network at all**:
 <DIR>/
   transactions.json   # JSON array of InsertTransactionObject dicts (exclude_none),
                        # in deterministic order (sorted by external_id) for stable diffs
-  split_pass.json     # list of {ynab_parent_id, child_transactions:[SplitTransactionObject...]}
-                       # sorted by ynab_parent_id — the Pass-2 split requests (§4.2)
-  summary.json        # bucket counts from TransactionPlan (incl. splits_native, split_children)
+  split_pass.json     # list of {parent_lm_id, child_transactions:[SplitTransactionObject...]}
+                       # sorted by parent_lm_id — the Pass-2 split requests (§4.2)
 ```
 
-`existing_ynab_ids()` returns `set()` (fresh dump) — or, optionally, reads back its own prior
-`transactions.json` so re-running into the same dir is idempotent (nice for tests). `split()`
-appends a record to `split_pass.json` and returns synthetic sequential ids (DirSink does no
-network). `insert()` accumulates; `close()` flushes once, sorted, so output is reproducible.
+`scan_imported()` returns `[]` (no persistent LM side in `--to-dir` mode; runs use fresh
+dirs). `insert()` accumulates and returns synthetic sequential ids in `id_by_external`, so
+the in-memory index drives Pass 2 the same way as `ApiSink`. `split()` appends a record to
+`split_pass.json`. `close()` flushes once, sorted, so output is reproducible.
 
 This is the artifact unit tests assert against.
 
@@ -358,6 +374,8 @@ This is the artifact unit tests assert against.
 - New flags on the `import` subcommand:
   - `--to-dir DIR` — use `DirSink` writing LM JSON to DIR (selects sink; works with or
     without `--apply`; needs **no** `LUNCHMONEY_API_TOKEN`).
+  - `--rebuild-index` — discard and re-scan the local already-imported index from LM (§7).
+    The index is built automatically on the first run; this forces a refresh.
   - `--since`, `--opening-balance-category`, `--deferred-income-as`, `--on-missing` (above).
 - Sink selection in `cmd_import`/`main`: `--to-dir` → `DirSink`; else `ApiSink(LMClient(token))`.
   When `--to-dir` is given, skip the `get_me()` call — instead require `--lm-account-id`

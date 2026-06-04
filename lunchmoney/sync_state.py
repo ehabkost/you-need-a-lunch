@@ -27,6 +27,12 @@ Schema:
       lm_name: str
       lm_group_id: int | null
       synced_at: str
+  transactions:
+    <ynab-uuid>:
+      lm_id: int           # LM transaction ID this YNAB txn was imported as
+      split_done: bool     # split parent: True once pass-2 split applied
+      synced_at: str
+  txn_index_built: bool    # True once the LM-side txn index has been built/reconciled
 """
 from __future__ import annotations
 
@@ -68,6 +74,13 @@ class CategoryEntry(BaseModel):
     synced_at: str = ""
 
 
+class TxnEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lm_id: int
+    split_done: bool = False           # split parents only: True once pass-2 split applied
+    synced_at: str = ""
+
+
 class SyncStateData(BaseModel):
     model_config = ConfigDict(extra="allow")
     schema_version: int = SCHEMA_VERSION
@@ -86,6 +99,14 @@ class SyncStateData(BaseModel):
     # Used by Phase 1 to distinguish intentionally-unmapped categories from mapping errors.
     # Keys: "inflow", "uncategorized"
     ynab_internal_cats: dict[str, str] = Field(default_factory=dict)
+    # Set to True after pass 1 (transaction insert) completes successfully.
+    txn_pass1_done: bool = False
+    # YNAB txn UUID -> imported LM transaction. Built during import and rebuildable
+    # from LM via custom_metadata.ynab_id. Used to skip already-imported txns so we
+    # don't re-POST thousands of transactions on every run.
+    transactions: dict[str, TxnEntry] = Field(default_factory=dict)
+    # True once the LM-side transaction index has been built/reconciled at least once.
+    txn_index_built: bool = False
 
 
 class SyncState:
@@ -163,6 +184,37 @@ class SyncState:
 
     def set_ynab_internal_cat(self, key: str, ynab_id: str) -> None:
         self._d.ynab_internal_cats[key] = ynab_id
+
+    # ── transactions ──────────────────────────────────────────────────────────
+
+    def txn(self, ynab_id: str) -> Optional[TxnEntry]:
+        return self._d.transactions.get(ynab_id)
+
+    def set_txn(self, ynab_id: str, *, lm_id: int, split_done: bool = False) -> None:
+        self._d.transactions[ynab_id] = TxnEntry(
+            lm_id=lm_id, split_done=split_done, synced_at=_now(),
+        )
+
+    def mark_split_done(self, ynab_id: str) -> None:
+        e = self._d.transactions.get(ynab_id)
+        if e:
+            e.split_done = True
+            e.synced_at = _now()
+
+    def synced_txn_ids(self) -> set[str]:
+        return set(self._d.transactions.keys())
+
+    def clear_transactions(self) -> None:
+        """Drop the local txn index (used by --rebuild-index before re-scanning LM)."""
+        self._d.transactions.clear()
+        self._d.txn_index_built = False
+
+    @property
+    def txn_index_built(self) -> bool:
+        return self._d.txn_index_built
+
+    def set_txn_index_built(self, value: bool = True) -> None:
+        self._d.txn_index_built = value
 
     @property
     def currency(self) -> str:
