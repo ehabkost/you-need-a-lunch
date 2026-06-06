@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from lm_api_types_generated import InsertTransactionObject, SplitTransactionObject
+from lm_api_types_generated import (
+    InsertTransactionObject,
+    SplitTransactionObject,
+    TransactionObject,
+)
 from lm_client import LMClient
 
 
@@ -18,6 +22,46 @@ class ScannedTxn:
     split_done: bool = False
     lm_hash: str = ""
     child_map: dict[str, int] = field(default_factory=dict)  # sub_ynab_id -> child_lm_id
+
+
+def lm_fields_from_transaction(t: TransactionObject) -> dict[str, Any]:
+    """Extract the LM payload fields used for hashing/diffing from a live LM transaction.
+
+    Must stay in sync with transactions.insert_lm_fields (the YNAB-derived side) so the
+    two are directly comparable.
+    """
+    date_str = t.date.isoformat() if hasattr(t.date, "isoformat") else str(t.date)
+    fields: dict[str, Any] = {
+        "date": date_str, "amount": t.amount, "payee": t.payee,
+        "category_id": t.category_id, "notes": t.notes,
+        "status": t.status.value if hasattr(t.status, "value") else t.status,
+    }
+    if t.is_split_parent and t.children:
+        fields["split_children"] = [
+            {"amount": c.amount, "category_id": c.category_id,
+             "notes": c.notes, "payee": c.payee}
+            for c in t.children
+        ]
+    return fields
+
+
+def scanned_from_transactions(txns: list[TransactionObject]) -> list[ScannedTxn]:
+    """Build the ynab_id↔lm_id index from a list of LM transactions.
+
+    Only transactions carrying custom_metadata.ynab_id (i.e. imported by this tool)
+    are kept. Split children carry no ynab_id and are ignored.
+    """
+    from sync_state import compute_lm_hash
+    result: list[ScannedTxn] = []
+    for t in txns:
+        ynab_id = (t.custom_metadata or {}).get("ynab_id")
+        if not ynab_id:
+            continue
+        lm_hash = compute_lm_hash(lm_fields_from_transaction(t))
+        result.append(ScannedTxn(ynab_id=str(ynab_id), lm_id=t.id,
+                                 split_done=bool(t.is_split_parent),
+                                 lm_hash=lm_hash))
+    return result
 
 
 @dataclass
@@ -52,34 +96,23 @@ class ApiSink:
         scan (they're flagged is_split_parent), so no per-parent lookups are needed.
         Split children carry no ynab_id and are ignored.
         """
-        from sync_state import compute_lm_hash
         txns = self._client.get_transactions(
             start_date="1900-01-01", end_date="2100-01-01",
             include_split_parents="true",
             include_children="true",
         )
-        result: list[ScannedTxn] = []
-        for t in txns:
-            ynab_id = (t.custom_metadata or {}).get("ynab_id")
-            if not ynab_id:
-                continue
-            date_str = t.date.isoformat() if hasattr(t.date, "isoformat") else str(t.date)
-            fields: dict[str, Any] = {
-                "date": date_str, "amount": t.amount, "payee": t.payee,
-                "category_id": t.category_id, "notes": t.notes,
-                "status": t.status.value if hasattr(t.status, "value") else t.status,
-            }
-            if t.is_split_parent and t.children:
-                fields["split_children"] = [
-                    {"amount": c.amount, "category_id": c.category_id,
-                     "notes": c.notes, "payee": c.payee}
-                    for c in t.children
-                ]
-            lm_hash = compute_lm_hash(fields)
-            result.append(ScannedTxn(ynab_id=str(ynab_id), lm_id=t.id,
-                                     split_done=bool(t.is_split_parent),
-                                     lm_hash=lm_hash))
-        return result
+        return scanned_from_transactions(txns)
+
+    def export(self, out_dir: Path) -> list[ScannedTxn]:
+        """Save a full LM snapshot to *out_dir* and return the already-imported index.
+
+        Fetches LM data once (via export.fetch_all) and reuses the transactions to
+        build the index, so --rebuild-index doesn't pull transactions twice.
+        """
+        from export import write_export, fetch_all
+        snapshot = fetch_all(self._client)
+        write_export(snapshot, out_dir)
+        return scanned_from_transactions(snapshot.transactions)
 
     def insert(self, txns: list[InsertTransactionObject]) -> InsertResult:
         if not txns:

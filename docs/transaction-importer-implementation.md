@@ -289,7 +289,11 @@ duplicates, which abuses the API and makes dry-runs lie ("would import 12068").
   it scans LM once (`sink.scan_imported()`) and records every `ynab_id ↔ lm_id` pair found
   via `custom_metadata.ynab_id`. This is read-only, runs in dry-run too, and migrates an
   account that was imported before the index existed. `--rebuild-index` forces a discard +
-  re-scan (`sync.clear_transactions()` then rebuild).
+  re-scan (`sync.clear_transactions()` then rebuild). On `--rebuild-index` against the API,
+  `phase_transactions` also calls `ApiSink.export(sync_dir)` to write a full LM snapshot
+  (`manual_accounts.json`, `plaid_accounts.json`, `categories.json`, `transactions.json`) beside
+  `sync_state.json`; that single fetch (`export.fetch_all`) is reused to build the index, so
+  transactions are not pulled twice. See `lunchmoney/export.py`.
 - **Planning.** `build_transaction_plan` stays pure; the phase then partitions importable
   items into *new* (`ynab_id not in synced_ids`) vs *already imported*, and the dry-run
   counts/summary reflect **only the new work**. Already-imported txns show under

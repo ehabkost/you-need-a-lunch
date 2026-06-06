@@ -11,6 +11,7 @@ Usage:
 """
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import date, datetime, timezone
@@ -31,7 +32,7 @@ from transactions import (
     TxnImportOptions, TransactionPlan, build_transaction_plan, preflight_check,
     TxnUpdateItem, TransactionUpdatePlan, build_transaction_update_plan, compute_insert_lm_hash,
 )
-from sinks import ApiSink, DirSink, InsertResult, TransactionSink
+from sinks import ApiSink, DirSink, InsertResult, ScannedTxn, TransactionSink
 
 # Useful for some generic account handling functions:
 AnyCategory = CategoryObject | ChildCategoryObject
@@ -41,6 +42,19 @@ AnyAccount = ManualAccountObject | PlaidAccountObject
 YnabAccount = dict[str, Any]
 
 LM_CACHE_FILE = "lm_cache.json"
+
+logger = logging.getLogger("ynab2lm")
+
+
+def setup_logging(verbosity: int) -> None:
+    """Configure logging from a -v count: 0=WARNING, 1=INFO (-v), 2+=DEBUG (-vv/--debug)."""
+    if verbosity >= 2:
+        level, fmt = logging.DEBUG, "%(levelname)s %(name)s: %(message)s"
+    elif verbosity == 1:
+        level, fmt = logging.INFO, "%(message)s"
+    else:
+        level, fmt = logging.WARNING, "%(message)s"
+    logging.basicConfig(level=level, format=fmt, stream=sys.stderr)
 
 # ── YNAB account type → LM account (type, subtype) ──────────────────────────
 
@@ -1616,9 +1630,14 @@ def _print_transaction_plan(c: dict[str, int], needs_decision: list[Any],
 
 
 def _reconcile_txn_index(sink: TransactionSink, sync: SyncState, sync_dir: Path,
-                         *, force: bool) -> None:
+                         *, force: bool,
+                         prescanned: list[ScannedTxn] | None = None) -> None:
     """Build/refresh the local ynab_id↔lm_id index from LM so already-imported
-    transactions are skipped instead of re-POSTed. Read-only against LM."""
+    transactions are skipped instead of re-POSTed. Read-only against LM.
+
+    *prescanned*: index already built from a fetch elsewhere (e.g. the snapshot
+    export done by --rebuild-index), to avoid re-fetching transactions.
+    """
     if not force and sync.txn_index_built:
         return
     if force:
@@ -1626,7 +1645,7 @@ def _reconcile_txn_index(sink: TransactionSink, sync: SyncState, sync_dir: Path,
         sync.clear_transactions()
     else:
         print("  Building local transaction index from Lunch Money (first run)...")
-    scanned = sink.scan_imported()
+    scanned = prescanned if prescanned is not None else sink.scan_imported()
     for s in scanned:
         # ynab_hash intentionally left "" — we can't recover what YNAB looked like at import.
         # lm_hash is populated from actual LM data so update detection works post-rebuild.
@@ -1733,6 +1752,96 @@ def _apply_update_plan(
     return applied
 
 
+_LM_HASH_FIELDS = ("date", "amount", "payee", "category_id", "notes", "status", "split_children")
+
+
+def _norm_field(key: str, value: Any) -> Any:
+    """Normalize a field the same way compute_lm_hash does, so diffs match the hash."""
+    if key == "split_children" and value:
+        import json as _j
+        return sorted(
+            ({"amount": c.get("amount"), "category_id": c.get("category_id"),
+              "notes": c.get("notes"), "payee": c.get("payee")} for c in value),
+            key=lambda c: _j.dumps(c, sort_keys=True),
+        )
+    return value
+
+
+def _log_update_diffs(
+    update_plan: TransactionUpdatePlan,
+    ynab_txns: list[dict[str, Any]],
+    ynab_accounts: list[dict[str, Any]],
+    sync: SyncState,
+    sync_dir: Path,
+    options: TxnImportOptions,
+) -> None:
+    """Explain *why* each flagged update differs by comparing the live LM snapshot
+    (data/<slug>/<lm_account_id>/transactions.json) against the freshly-derived LM
+    payload, field by field. Diagnoses non-idempotent conversions after --rebuild-index.
+
+    Summary goes to INFO (-v); per-txn examples to DEBUG (-vv/--debug). Only called when
+    INFO is enabled, so the snapshot load + re-classification cost is paid on demand."""
+    from export import TRANSACTIONS_FILE
+    from sinks import lm_fields_from_transaction
+    from transactions import insert_lm_fields, _classify_txn
+    from lm_api_types_generated import TransactionObject
+
+    snap_path = sync_dir / TRANSACTIONS_FILE
+    if not snap_path.exists():
+        logger.warning("update-diff: no LM snapshot at %s — run --rebuild-index to save one",
+                       snap_path)
+        return
+
+    lm_by_ynab: dict[str, dict[str, Any]] = {}
+    for d in json.loads(snap_path.read_text()):
+        ynab_id = (d.get("custom_metadata") or {}).get("ynab_id")
+        if ynab_id:
+            lm_by_ynab[str(ynab_id)] = lm_fields_from_transaction(TransactionObject(**d))
+
+    accts_by_id = {a["id"]: a for a in ynab_accounts}
+    ynab_by_id = {t["id"]: t for t in ynab_txns}
+    update_buckets = {"update_regular", "update_split_inplace", "update_split_structural"}
+
+    field_tally: dict[str, int] = {}
+    examples: dict[str, list[tuple[str, Any, Any]]] = {}
+    n_examined = n_unmatched = 0
+
+    for item in update_plan.items:
+        if item.bucket not in update_buckets:
+            continue
+        n_examined += 1
+        ytxn = ynab_by_id.get(item.ynab_id)
+        lm_fields = lm_by_ynab.get(item.ynab_id)
+        if ytxn is None or lm_fields is None:
+            n_unmatched += 1
+            continue
+        classified = _classify_txn(ytxn, accts_by_id, sync, options)
+        if classified.insert is None:
+            continue
+        new_fields = insert_lm_fields(classified.insert, classified.split_children)
+        for key in _LM_HASH_FIELDS:
+            if _norm_field(key, lm_fields.get(key)) != _norm_field(key, new_fields.get(key)):
+                field_tally[key] = field_tally.get(key, 0) + 1
+                ex = examples.setdefault(key, [])
+                if len(ex) < 10:
+                    ex.append((item.ynab_id, lm_fields.get(key), new_fields.get(key)))
+
+    logger.info("update-diff: examined %d flagged update(s); LM snapshot vs re-derived payload",
+                n_examined)
+    if n_unmatched:
+        logger.info("update-diff: %d not found in snapshot (skipped)", n_unmatched)
+    if not field_tally:
+        logger.info("update-diff: no field-level differences (mismatch may be in split structure)")
+        return
+    logger.info("update-diff: differing fields (a txn may differ in several):")
+    for key, cnt in sorted(field_tally.items(), key=lambda kv: -kv[1]):
+        logger.info("  %-16s %5d txn(s)", key, cnt)
+    for key in sorted(field_tally, key=lambda k: -field_tally[k]):
+        logger.debug("examples for %r (ynab_id  LM-value -> re-derived-value):", key)
+        for ynab_id, old, new in examples[key]:
+            logger.debug("  %s  %r -> %r", ynab_id[:8], old, new)
+
+
 def phase_transactions(
     data_dir: Path,
     sink: TransactionSink,
@@ -1769,8 +1878,13 @@ def phase_transactions(
         current_sk = ck.get("transactions", 0)
 
     # Reconcile the local index from LM before planning so the dry-run is accurate
-    # and apply doesn't re-send already-imported transactions.
-    _reconcile_txn_index(sink, sync, sync_dir, force=rebuild_index)
+    # and apply doesn't re-send already-imported transactions. On --rebuild-index,
+    # also save a full LM snapshot beside the sync state (one fetch feeds both).
+    prescanned: list[ScannedTxn] | None = None
+    if rebuild_index and isinstance(sink, ApiSink):
+        print(f"  Saving Lunch Money snapshot to {sync_dir}/ ...")
+        prescanned = sink.export(sync_dir)
+    _reconcile_txn_index(sink, sync, sync_dir, force=rebuild_index, prescanned=prescanned)
     synced_ids = sync.synced_txn_ids()
 
     skip_update_scan = (current_sk != 0 and current_sk == sync.ynab_txn_server_knowledge)
@@ -1806,6 +1920,8 @@ def phase_transactions(
         update_plan = build_transaction_update_plan(
             ynab_txns, ynab_accounts, sync=sync, options=options
         )
+        if logger.isEnabledFor(logging.INFO):
+            _log_update_diffs(update_plan, ynab_txns, ynab_accounts, sync, sync_dir, options)
         updates_applied = _apply_update_plan(update_plan, sink, sync, sync_dir, apply)
         n_planned_updates = sum(update_plan.counts.get(b, 0) for b in
                                 ("update_regular", "update_split_inplace", "update_split_structural"))
@@ -1971,6 +2087,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Import YNAB data into Lunch Money.")
     parser.add_argument("--data", metavar="DIR", required=True,
                         help="Path to YNAB export directory (e.g. data/brl)")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Increase log verbosity: -v shows diagnostics (e.g. the transaction "
+             "update-diff summary), -vv adds per-record DEBUG detail.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Shorthand for maximum (-vv) log verbosity.",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("show-mapping",  help="Display current mapping as a table (no API calls)")
@@ -2025,7 +2150,8 @@ def main() -> None:
         "--rebuild-index", action="store_true",
         help="Rebuild the local already-imported transaction index from Lunch Money "
              "before importing (discards and re-scans). The index is built automatically "
-             "on the first run; use this to force a refresh.",
+             "on the first run; use this to force a refresh. Also saves a full LM snapshot "
+             "(accounts, categories, transactions) beside the sync state.",
     )
     p_import.add_argument(
         "--force-ynab", action="store_true",
@@ -2033,6 +2159,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    setup_logging(2 if args.debug else args.verbose)
     data_dir = Path(args.data)
     if not data_dir.is_dir():
         print(f"Error: {data_dir} is not a directory", file=sys.stderr)

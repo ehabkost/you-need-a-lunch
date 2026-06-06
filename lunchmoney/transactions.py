@@ -425,14 +425,16 @@ class TransactionUpdatePlan:
     conflicts: list[TxnUpdateItem]
 
 
-def compute_insert_lm_hash(
+def insert_lm_fields(
     insert: InsertTransactionObject,
     split_children: Optional[list[SplitTransactionObject]] = None,
-) -> str:
-    """Compute lm_hash from the InsertTransactionObject that was (or will be) sent."""
-    from sync_state import compute_lm_hash
+) -> dict[str, Any]:
+    """Extract the LM payload fields (for hashing/diffing) from the insert we'd send.
+
+    Mirrors sinks.lm_fields_from_transaction (the live-LM side) so the two compare directly.
+    """
     d = insert.model_dump(mode="json", exclude_none=False)
-    fields = {
+    fields: dict[str, Any] = {
         "date": d.get("date"), "amount": d.get("amount"), "payee": d.get("payee"),
         "category_id": d.get("category_id"), "notes": d.get("notes"),
         "status": d.get("status"),
@@ -443,7 +445,16 @@ def compute_insert_lm_hash(
              if k in ("amount", "category_id", "notes", "payee")}
             for c in split_children
         ]
-    return compute_lm_hash(fields)
+    return fields
+
+
+def compute_insert_lm_hash(
+    insert: InsertTransactionObject,
+    split_children: Optional[list[SplitTransactionObject]] = None,
+) -> str:
+    """Compute lm_hash from the InsertTransactionObject that was (or will be) sent."""
+    from sync_state import compute_lm_hash
+    return compute_lm_hash(insert_lm_fields(insert, split_children))
 
 
 def _parent_only_payload(insert: InsertTransactionObject) -> dict[str, Any]:
