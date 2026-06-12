@@ -22,6 +22,7 @@ class ScannedTxn:
     split_done: bool = False
     lm_hash: str = ""
     child_map: dict[str, int] = field(default_factory=dict)  # sub_ynab_id -> child_lm_id
+    lm_recurring: bool = False  # linked to a recurring item (v2 `notes` is then display-only)
 
 
 def lm_fields_from_transaction(t: TransactionObject) -> dict[str, Any]:
@@ -33,7 +34,11 @@ def lm_fields_from_transaction(t: TransactionObject) -> dict[str, Any]:
     date_str = t.date.isoformat() if hasattr(t.date, "isoformat") else str(t.date)
     fields: dict[str, Any] = {
         "date": date_str, "amount": t.amount, "payee": t.payee,
-        "category_id": t.category_id, "notes": t.notes,
+        "category_id": t.category_id,
+        # For recurring-linked txns the v2 API returns `display_notes` (the recurring
+        # item's description) in `notes`, not the stored per-transaction note — so it's
+        # unreliable for diffing. Exclude it from the hash (see bugs/recurring-notes-*).
+        "notes": None if t.recurring_id is not None else t.notes,
         "status": t.status.value if hasattr(t.status, "value") else t.status,
     }
     if t.is_split_parent and t.children:
@@ -60,7 +65,8 @@ def scanned_from_transactions(txns: list[TransactionObject]) -> list[ScannedTxn]
         lm_hash = compute_lm_hash(lm_fields_from_transaction(t))
         result.append(ScannedTxn(ynab_id=str(ynab_id), lm_id=t.id,
                                  split_done=bool(t.is_split_parent),
-                                 lm_hash=lm_hash))
+                                 lm_hash=lm_hash,
+                                 lm_recurring=t.recurring_id is not None))
     return result
 
 
@@ -70,6 +76,7 @@ class InsertResult:
     skipped: int
     skipped_reasons: dict[str, int]            # Reason.value -> count
     id_by_external: dict[str, int] = field(default_factory=dict)  # ynab_id -> LM txn id
+    recurring_external: set[str] = field(default_factory=set)     # ynab_ids LM linked to a recurring item
 
 
 class TransactionSink(Protocol):
@@ -120,9 +127,12 @@ class ApiSink:
         resp = self._client.insert_transactions(txns)
         reasons: dict[str, int] = {}
         id_by_external: dict[str, int] = {}
+        recurring_external: set[str] = set()
         for t in resp.transactions:
             if t.external_id and t.id is not None:
                 id_by_external[t.external_id] = t.id
+                if t.recurring_id is not None:
+                    recurring_external.add(t.external_id)
         for skip in resp.skipped_duplicates:
             key = skip.reason.value if skip.reason else "unknown"
             reasons[key] = reasons.get(key, 0) + 1
@@ -135,6 +145,7 @@ class ApiSink:
             skipped=len(resp.skipped_duplicates),
             skipped_reasons=reasons,
             id_by_external=id_by_external,
+            recurring_external=recurring_external,
         )
 
     def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> list[int]:

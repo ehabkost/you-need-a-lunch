@@ -739,6 +739,56 @@ def test_inplace_parent_and_all_children_updated():
     assert entry.lm_hash != "old"
 
 
+def test_recurring_readback_excludes_notes_from_lm_hash():
+    """sinks.lm_fields_from_transaction must drop `notes` when the live txn is recurring
+    (v2 returns display_notes there), but keep it otherwise."""
+    from datetime import date as date_cls
+    from sinks import lm_fields_from_transaction
+    from lm_api_types_generated import TransactionObject
+
+    def _txn(recurring_id):
+        return TransactionObject.model_construct(
+            id=1, date=date_cls(2024, 1, 15), amount="-50.0000", currency="cad",
+            status="reviewed", notes="my memo", recurring_id=recurring_id,
+            payee="Supermarket", category_id=CAT_LM_ID,
+            is_split_parent=False, children=None,
+        )
+
+    assert lm_fields_from_transaction(_txn(None))["notes"] == "my memo"
+    assert lm_fields_from_transaction(_txn(2869334))["notes"] is None
+
+
+def test_recurring_txn_with_memo_no_phantom_update():
+    """A recurring-linked txn whose YNAB memo is unchanged must NOT be re-flagged for
+    update, even though v2 reads its notes back as null (option (b): notes excluded from
+    the lm_hash when lm_recurring)."""
+    from datetime import date as date_cls
+    txn = make_ynab_txn(memo="monthly subscription note")
+    yh = compute_ynab_hash(txn)
+    insert = InsertTransactionObject(
+        date=date_cls.fromisoformat(txn["date"]),
+        amount=f"{-txn['amount'] / 1000:.4f}", payee=txn.get("payee_name"),
+        category_id=CAT_LM_ID, notes=txn["memo"], status="reviewed",
+        manual_account_id=101, external_id=txn["id"],
+        custom_metadata={"ynab_id": txn["id"]},
+    )
+    # Stored lm_hash as recorded for a recurring txn: notes excluded.
+    lh = compute_insert_lm_hash(insert, lm_recurring=True)
+    sync = make_sync(transactions={"txn-1": {
+        "lm_id": 10, "ynab_hash": yh, "lm_hash": lh, "lm_recurring": True}})
+
+    plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
+    assert plan.items[0].bucket == "skipped_no_change"
+
+    # Sanity: without the recurring flag the same stored hash WOULD look like a change
+    # (this is the phantom-update bug the flag fixes).
+    sync_buggy = make_sync(transactions={"txn-1": {
+        "lm_id": 10, "ynab_hash": yh, "lm_hash": lh, "lm_recurring": False}})
+    plan_buggy = build_transaction_update_plan([txn], ynab_accounts(), sync=sync_buggy,
+                                               options=_options())
+    assert plan_buggy.items[0].bucket != "skipped_no_change"
+
+
 def test_inplace_does_not_touch_split_children_map():
     subs = [make_sub("s1", -20000), make_sub("s2", -30000)]
     txn = make_split_ynab_txn("p1", subs)

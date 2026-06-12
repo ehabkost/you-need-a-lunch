@@ -200,8 +200,9 @@ def cmd_seed(c: LMClient, account_id: int, count: int, amount: str,
             date=d, amount=amount, currency="cad", payee=payee,
             notes=note, status="unreviewed", manual_account_id=account_id,
             external_id=f"{marker_base}-{i}",
+            custom_metadata={"probe_memo": note, "ynab_id": f"fake-{i}"},
         ))
-        print(f"  {d}  notes={note!r}")
+        print(f"  {d}  notes={note!r}  custom_metadata.probe_memo={note!r}")
 
     print("\nPOST all in ONE request...")
     resp = c.insert_transactions(inserts)
@@ -210,12 +211,14 @@ def cmd_seed(c: LMClient, account_id: int, count: int, amount: str,
     new_ids = [t.id for t in resp.transactions]
     print(f"  new ids: {new_ids}")
 
-    print("\nImmediate read-back:")
+    print("\nImmediate read-back (does custom_metadata survive recurring linking?):")
     after = []
     for nid in new_ids:
         t = c.get_transaction(nid)
         after.append(_row(t))
-        print(f"  id={t.id}  notes={t.notes!r}  recurring_id={t.recurring_id}")
+        cm = t.custom_metadata or {}
+        print(f"  id={t.id}  recurring_id={t.recurring_id}  notes={t.notes!r}  "
+              f"custom_metadata={cm!r}")
     n_match = sum(1 for r in after if r["recurring_id"] is not None)
     print(f"\n  matched to a recurring item at insert: {n_match}/{len(after)}")
     print("  (LM's create-new-recurring detector is async; use `recheck` later.)")

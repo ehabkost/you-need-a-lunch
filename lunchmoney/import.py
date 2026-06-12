@@ -1649,7 +1649,8 @@ def _reconcile_txn_index(sink: TransactionSink, sync: SyncState, sync_dir: Path,
     for s in scanned:
         # ynab_hash intentionally left "" — we can't recover what YNAB looked like at import.
         # lm_hash is populated from actual LM data so update detection works post-rebuild.
-        sync.set_txn(s.ynab_id, lm_id=s.lm_id, split_done=s.split_done, lm_hash=s.lm_hash)
+        sync.set_txn(s.ynab_id, lm_id=s.lm_id, split_done=s.split_done, lm_hash=s.lm_hash,
+                     lm_recurring=s.lm_recurring)
         for sub_ynab_id, child_lm_id in s.child_map.items():
             sync.set_split_child(sub_ynab_id, child_lm_id)
     sync.set_txn_index_built(True)
@@ -1947,9 +1948,10 @@ def phase_transactions(
     for ynab_id, lm_id in result.id_by_external.items():
         ynab_txn = ynab_txn_by_id.get(ynab_id)
         c = classified_by_id.get(ynab_id)
+        rec = ynab_id in result.recurring_external
         yh = compute_ynab_hash(ynab_txn) if ynab_txn else ""
-        lh = compute_insert_lm_hash(c.insert, c.split_children) if (c and c.insert) else ""
-        sync.set_txn(ynab_id, lm_id=lm_id, ynab_hash=yh, lm_hash=lh)
+        lh = compute_insert_lm_hash(c.insert, c.split_children, lm_recurring=rec) if (c and c.insert) else ""
+        sync.set_txn(ynab_id, lm_id=lm_id, ynab_hash=yh, lm_hash=lh, lm_recurring=rec)
     sync.save(sync_dir)
     print(f"  {GREEN}✓{RESET} Pass 1: {result.inserted} inserted, {result.skipped} skipped as duplicates")
 

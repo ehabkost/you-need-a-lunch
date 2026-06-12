@@ -428,15 +428,21 @@ class TransactionUpdatePlan:
 def insert_lm_fields(
     insert: InsertTransactionObject,
     split_children: Optional[list[SplitTransactionObject]] = None,
+    *,
+    lm_recurring: bool = False,
 ) -> dict[str, Any]:
     """Extract the LM payload fields (for hashing/diffing) from the insert we'd send.
 
     Mirrors sinks.lm_fields_from_transaction (the live-LM side) so the two compare directly.
+    When *lm_recurring*, `notes` is excluded (set to None) because LM's v2 API reports
+    `display_notes` for recurring-linked txns, so it can't be compared — see
+    bugs/recurring-notes-dropped-on-put.md.
     """
     d = insert.model_dump(mode="json", exclude_none=False)
     fields: dict[str, Any] = {
         "date": d.get("date"), "amount": d.get("amount"), "payee": d.get("payee"),
-        "category_id": d.get("category_id"), "notes": d.get("notes"),
+        "category_id": d.get("category_id"),
+        "notes": None if lm_recurring else d.get("notes"),
         "status": d.get("status"),
     }
     if split_children:
@@ -451,10 +457,12 @@ def insert_lm_fields(
 def compute_insert_lm_hash(
     insert: InsertTransactionObject,
     split_children: Optional[list[SplitTransactionObject]] = None,
+    *,
+    lm_recurring: bool = False,
 ) -> str:
     """Compute lm_hash from the InsertTransactionObject that was (or will be) sent."""
     from sync_state import compute_lm_hash
-    return compute_lm_hash(insert_lm_fields(insert, split_children))
+    return compute_lm_hash(insert_lm_fields(insert, split_children, lm_recurring=lm_recurring))
 
 
 def _parent_only_payload(insert: InsertTransactionObject) -> dict[str, Any]:
@@ -491,7 +499,10 @@ def build_transaction_update_plan(
         if classified.insert is None:
             continue
 
-        new_lm_hash = compute_insert_lm_hash(classified.insert, classified.split_children)
+        new_lm_hash = compute_insert_lm_hash(
+            classified.insert, classified.split_children,
+            lm_recurring=getattr(entry, "lm_recurring", False),
+        )
         stored_ynab = entry.ynab_hash
         stored_lm   = entry.lm_hash
 

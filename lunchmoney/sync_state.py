@@ -82,6 +82,7 @@ class TxnEntry(BaseModel):
     split_done: bool = False           # split parents only: True once pass-2 split applied
     ynab_hash: str = ""                # hash of YNAB input fields at last import
     lm_hash: str = ""                  # hash of LM payload fields at last import
+    lm_recurring: bool = False         # linked to a recurring item (notes excluded from lm_hash)
     synced_at: str = ""
 
 
@@ -200,10 +201,17 @@ class SyncState:
         return self._d.transactions.get(ynab_id)
 
     def set_txn(self, ynab_id: str, *, lm_id: int, split_done: bool = False,
-                ynab_hash: str = "", lm_hash: str = "") -> None:
+                ynab_hash: str = "", lm_hash: str = "",
+                lm_recurring: bool | None = None) -> None:
+        # lm_recurring=None preserves the existing flag (e.g. on update-apply, which
+        # doesn't re-observe recurring status); pass an explicit bool to set it.
+        if lm_recurring is None:
+            existing = self._d.transactions.get(ynab_id)
+            lm_recurring = existing.lm_recurring if existing else False
         self._d.transactions[ynab_id] = TxnEntry(
             lm_id=lm_id, split_done=split_done,
-            ynab_hash=ynab_hash, lm_hash=lm_hash, synced_at=_now(),
+            ynab_hash=ynab_hash, lm_hash=lm_hash,
+            lm_recurring=lm_recurring, synced_at=_now(),
         )
 
     def mark_split_done(self, ynab_id: str,
