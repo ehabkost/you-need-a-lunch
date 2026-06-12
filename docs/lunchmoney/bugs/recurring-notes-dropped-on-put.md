@@ -1,48 +1,6 @@
-# Lunch Money API Bug Reports
+# Bug: `notes` silently dropped on transactions matched to a recurring item (2026-06-06)
 
-## Bug 1: POST /transactions returns 500 — `original_name` missing DB column (2026-06-02)
-
-### Symptom
-
-`POST /transactions` returns HTTP 500 with:
-
-```json
-{
-  "message": "Undefined binding(s) detected when compiling SELECT. Undefined column(s): [original_name] query: select * from \"recurring_expenses\" where \"account_id\" = ? and \"original_name\" = ? and \"amount\" = ? and \"currency\" = ?",
-  "errors": []
-}
-```
-
-### Root cause
-
-This is a **server-side LM bug**. When inserting a transaction, LM's recurring-expense matching logic runs a SQL query that references `original_name` as a column on the `recurring_expenses` table. That column does not exist in the DB schema, causing the 500.
-
-Our importer does **not** send `original_name` in the request body (we use `model_dump(mode="json", exclude_none=True)` and never set the field). The bug is triggered regardless — LM always runs this query when inserting into an account that has recurring items.
-
-### Reproducer
-
-```sh
-curl -s -X POST https://api.lunchmoney.dev/v2/transactions \
-  -H "Authorization: Bearer $LUNCHMONEY_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"transactions":[{"date":"2024-01-01","amount":"10.00","payee":"Test","manual_account_id":341928}]}'
-```
-
-### Workaround
-
-None on our side — this is entirely in LM's server. We cannot work around it by changing request shape. Need LM to add the missing column or remove it from the query.
-
-### Status
-
-- **Likely transient.** Re-running all 25 batches (12,026 txns total) the next day completed without error. First 8 batches skipped as duplicates (already inserted in the failed run); remaining 17 batches inserted successfully.
-- Not yet reported to LM support — may have been a momentary server issue.
-- Not currently blocking.
-
----
-
-## Bug 2: `notes` silently dropped on transactions matched to a recurring item (2026-06-06)
-
-### Symptom
+## Symptom
 
 After importing the CAD budget, a routine dry-run reported **857 transactions "would update (YNAB changed since last import)"** even though nothing had changed in YNAB. Running `import` again kept reporting the same updates — they never converged.
 
@@ -51,7 +9,7 @@ After importing the CAD budget, a routine dry-run reported **857 transactions "w
   Would update    857  transaction(s) (YNAB changed since last import)
 ```
 
-### Investigation
+## Investigation
 
 The built-in update-diff (`-vv`, function `_log_update_diffs` in `lunchmoney/import.py`)
 broke the 857 down by the field that differs between the LM snapshot and the freshly
@@ -95,7 +53,7 @@ Focusing on the 490 `notes` losses:
    HAVE notes:    recurring=0    non-recurring=3080
    ```
 
-### Reproducer (controlled live probe)
+## Reproducer (controlled live probe)
 
 `scripts/probe_put_notes.py` runs `GET → PUT{notes} → GET → PUT{payee, no notes} → GET → restore`
 against `LUNCHMONEY_API_TOKEN` (test account via `./test-run.sh`).
@@ -114,7 +72,7 @@ against `LUNCHMONEY_API_TOKEN` (test account via `./test-run.sh`).
   ```
   Both PUTs returned success and bumped `updated_at`, but **no field actually changed**.
 
-### Root cause
+## Root cause
 
 **Lunch Money does not persist the `notes` field on a transaction once it is matched to a
 recurring item, and it silently ignores subsequent `PUT` field updates on such transactions**
@@ -135,7 +93,7 @@ Sequence that produced the symptom:
 4. Because PUT can never write notes onto a recurring-locked txn, the `lm_hash` never converges and
    the dry-run re-flags the same 490 on every run.
 
-### Notes on LM behavior discovered along the way
+## Notes on LM behavior discovered along the way
 
 - **The in-app "Change History" panel does not record API `PUT` updates** — only creation (and
   presumably manual UI edits). It cannot be used to audit what the API changed.
@@ -143,14 +101,14 @@ Sequence that produced the symptom:
 - `PUT /transactions/{id}` is a **merge** (partial update), not a full replace: fields omitted from
   the body are preserved.
 
-### Impact on the importer
+## Impact on the importer
 
 - 490 phantom "would update" rows that never converge (CAD budget; scales with how many imported
   txns LM auto-matches to recurring items — bank fees, transfers, subscriptions, etc.).
 - The lost notes are **not recoverable via the API** while the txn stays matched to a recurring
   item.
 
-### Recommended handling (our side)
+## Recommended handling (our side)
 
 1. **Stop re-flagging:** in `build_transaction_update_plan`, when the live txn has a `recurring_id`,
    exclude `notes` (and any other LM-locked field) from the update comparison / hash, or skip the
@@ -160,7 +118,7 @@ Sequence that produced the symptom:
 3. Consider reporting to LM support: POST should honor the submitted `notes` even when it matches a
    recurring item; PUT should not silently ignore field updates (or should return an error/flag).
 
-### Related (separate comparison bugs surfaced by the same dry-run)
+## Related (separate comparison bugs surfaced by the same dry-run)
 
 Independent of the recurring-notes issue, two of the 857 buckets are false positives caused by
 non-idempotent comparison in our own hash logic — fix these so the dry-run is trustworthy:
@@ -172,7 +130,7 @@ non-idempotent comparison in our own hash logic — fix these so the dry-run is 
 - **`payee` "[No Payee]" (24):** LM stores the literal string `"[No Payee]"` where we send `None`.
   The comparison must treat `"[No Payee]" == None`.
 
-### Status
+## Status
 
 - Root cause confirmed via live probe on the test account (2026-06-06). Not yet reported to LM.
 - Importer not yet changed; phantom updates are harmless (PUTs are no-ops) but noisy and block a
