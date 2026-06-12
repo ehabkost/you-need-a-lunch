@@ -8,6 +8,132 @@ Companion docs:
 - [transaction-importer-implementation.md](transaction-importer-implementation.md) — Phase 1 insert architecture (splits, sinks, sync_state)
 - [api-reference.md](api-reference.md) — YNAB and LM field reference
 
+> **⚠ Superseded in part — read [Revision 2](#revision-2-2026-06-12-drop-lm_hash-split-sync-from-reconcile) first.**
+> The original design below uses **two hashes** (`ynab_hash` + `lm_hash`) and recomputes
+> `lm_hash` from the LM read-back at `--rebuild-index`. That read-back path is exactly what
+> produced the never-converging "phantom update" bug (see
+> [bugs/recurring-notes-dropped-on-put.md](lunchmoney/bugs/recurring-notes-dropped-on-put.md):
+> the v2 API returns the *display* note for recurring-linked txns). Revision 2 replaces the
+> `lm_hash` half with an explicit, on-demand snapshot reconcile. The **split-update mechanics,
+> crash-resistance ordering, sink protocol, and `ynab_hash` definition below remain valid** and
+> are reused as-is; only the LM-side comparison changes.
+
+---
+
+## Revision 2 (2026-06-12): drop `lm_hash`, split sync from reconcile
+
+### Why
+
+`lm_hash` tried to answer "does LM still have what we'd send?" by storing a fingerprint and
+recomputing it from the live LM read-back at `--rebuild-index`. Two problems:
+
+1. **It baked the comparison/normalization logic into a stored fingerprint.** Any change to how
+   we compare (recurring `notes`, `"[No Payee]"`, split-child inheritance) invalidates every
+   stored `lm_hash`, forcing a full `--rebuild-index` re-baseline before the fix takes effect
+   — the exact "why do I need to rebuild to apply a one-line fix?" friction we hit.
+2. **The read-back is unreliable.** The v2 `GET` returns the recurring item's *display* note
+   for recurring-linked txns, so the recomputed `lm_hash` never matches what we'd send →
+   permanent phantom "would update" rows that re-PUT forever without converging.
+
+Both vanish if **sync never reads LM back**. The fingerprint we need is purely a function of
+YNAB data, which we already have (`ynab_hash`). LM read-back becomes a separate, opt-in
+*reconcile* step.
+
+### The two operations (decoupled)
+
+**1. Sync** — the normal `import … import` run. **Offline for reads; only writes hit the API.**
+
+- New txns → insert (unchanged from Phase 1).
+- Already-mapped txns → compare `ynab_hash`:
+  - `current_ynab_hash == stored` → skip (YNAB unchanged, nothing to push).
+  - `current_ynab_hash != stored` → derive the LM payload from current YNAB and `PUT` it
+    (PUT is a merge; sending the full derived payload is idempotent), then store the new
+    `ynab_hash`.
+  - `stored == ""` (freshly built index, no baseline) → **establish baseline**: store
+    `current_ynab_hash`, issue no update (assume LM already reflects YNAB; the reconcile step
+    is how you verify that assumption).
+- No `lm_hash`, no `lm_recurring`, no LM read. Decision table collapses to:
+
+  | `ynab_hash` vs stored | action |
+  |---|---|
+  | equal | `skip` |
+  | differ | `update` (PUT derived payload) |
+  | stored empty | `baseline` (store hash, no update) |
+
+  Optional refinement (avoid no-op PUTs when a YNAB change touched only unmapped fields):
+  also store a `derived_hash` — a hash of the **YNAB-derived LM payload** (never of an LM
+  read-back). Skip the PUT when `derived_hash` is unchanged even though `ynab_hash` changed.
+  This is the *only* sanctioned LM-payload hash; because it's computed solely from our own
+  derivation it never needs a rebuild and never sees the v2 display-note. (Decide at impl time
+  whether the extra field is worth it; plain "PUT on any `ynab_hash` change" is acceptable.)
+
+**2. Reconcile** — an **explicit, separate** operation (e.g. `import … reconcile`, or a
+`--refetch` flag). This is the *only* thing that reads LM.
+
+- Fetch the full LM snapshot, save it to `data/<slug>/<lm_id>/transactions.json` (the format
+  `export.py` already writes; `--rebuild-index` already saves it), and (re)build the
+  `ynab_id → lm_id` id-map index.
+- For each mapped txn, compare the **YNAB-derived payload** against the **snapshot** field by
+  field through one normalizing comparator `lm_payload_equal(derived, snapshot)` (below).
+- **Report** the inconsistencies (LM differs from what YNAB would produce) grouped by field —
+  reusing the existing `_log_update_diffs` breakdown. Optionally offer to fix them by pushing
+  YNAB→LM (same PUT path as sync) and/or to refresh `ynab_hash` for rows that already match.
+- Staleness is acceptable: the snapshot is a cached mirror, refreshed only here. We are not
+  trying to detect/preserve external LM edits in the hot path (one-way sync focus). Our own
+  sync writes can update the on-disk snapshot in place so a later reconcile doesn't re-flag
+  rows we just wrote (optional; or just accept that reconcile re-derives the truth anyway).
+
+### `lm_payload_equal(derived, snapshot)` — the single comparator
+
+All LM-side normalization lives here, in full field values (not a hash), so it can change
+freely with **zero re-baselining**. Compares the fields currently in `_LM_HASH_FIELDS`
+(`date, amount, payee, category_id, notes, status`, plus `split_children`) with these rules:
+
+- **Recurring `notes`/`payee`:** when `snapshot.recurring_id is not None`, the snapshot's
+  `notes`/`payee` are the recurring item's *inherited display* values (v2 quirk) — exclude
+  them from the comparison. (Replaces this session's `lm_recurring` flag entirely.)
+- **`"[No Payee]"` ≡ `None`:** LM stores the literal `"[No Payee]"` where we send `None`.
+- **Split-child inheritance:** a child whose snapshot `payee`/`notes` equals its parent's is
+  inheriting it — normalize those to `None` before comparing to our re-derived children
+  (which carry `None`). Compare child `amount`/`category_id` strictly.
+
+These three are precisely the open false-positive buckets (`split_children` 345, `payee` 24,
+recurring `notes` 490 — see the bug doc); folding them into one comparator clears them without
+the rebuild dance.
+
+### Code deltas vs the original design below
+
+- **`sync_state.TxnEntry`:** drop `lm_hash` and `lm_recurring`. Keep `ynab_hash`, `lm_id`,
+  `split_done`. (Optionally add `derived_hash`.) Old files load fine — extra keys are ignored,
+  missing keys default.
+- **`sinks.ScannedTxn` / `InsertResult`:** drop `lm_hash` and `recurring_external`. `scan`
+  still returns the id-map (+ `child_map`); the snapshot itself is what reconcile compares.
+- **`transactions`:** remove `compute_insert_lm_hash` / `compute_lm_hash` usage from the
+  decision path; keep `insert_lm_fields` / `sinks.lm_fields_from_transaction` as the two
+  *field extractors* feeding `lm_payload_equal`. `build_transaction_update_plan` for **sync**
+  uses only `ynab_hash`; a separate `build_reconcile_report` does the snapshot compare.
+- **`import.py`:** split the current `--rebuild-index` into (a) build-id-map (still needed once
+  to map ynab↔lm) and (b) the explicit reconcile/refetch. Sync no longer reads LM.
+- **Removes this session's work:** the `lm_recurring` plumbing added in commit `6f7c7f5`
+  (sync_state field, `InsertResult.recurring_external`, `compute_insert_lm_hash(lm_recurring=)`,
+  the `_log_update_diffs` consistency tweak) is superseded — the recurring rule moves into
+  `lm_payload_equal`. Net deletion.
+
+### Open decisions (resolve at implementation)
+
+1. **CLI shape:** new `reconcile` subcommand vs `import --refetch`? (Leaning subcommand —
+   reads vs writes are genuinely different operations.)
+2. **`derived_hash` optimization:** add it to suppress no-op PUTs on unmapped-field changes, or
+   keep it simple and PUT on any `ynab_hash` change?
+3. **Reconcile auto-fix:** report-only, or offer `--apply` to push YNAB→LM for flagged rows?
+4. **Conflict guard:** the original "don't overwrite LM edits" guard depended on `lm_hash`.
+   Under one-way-only focus it's dropped from sync; if wanted later it becomes a reconcile-time
+   warning ("LM differs but YNAB didn't change since last sync") rather than a sync-time bucket.
+
+The remainder of this document is the **original two-hash design** (largely implemented). Treat
+its `lm_hash` / decision-table / `--rebuild-index` portions as superseded by this section; its
+split-update mechanics, crash-resistance ordering, sink protocol, and `ynab_hash` are retained.
+
 ---
 
 ## Background and design decisions
