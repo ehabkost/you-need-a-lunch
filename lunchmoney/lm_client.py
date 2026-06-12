@@ -183,6 +183,11 @@ class LMClient:
         resp = self._request("PUT", f"/transactions/{transaction_id}", body=data)
         return TransactionObject(**resp)
 
+    def delete_transaction(self, transaction_id: int) -> None:
+        """DELETE /transactions/{id} — permanently delete. Fails for split/group members
+        (LM responds with guidance to unsplit/ungroup first). Not reversible."""
+        self._request("DELETE", f"/transactions/{transaction_id}")
+
     def upsert_budget(self, start_date: str, category_id: int, amount: str, currency: str) -> dict[str, Any]:
         # Pass as dict since types don't match (pydantic coercion handles conversion)
         return self._request("PUT", "/budgets", body={
