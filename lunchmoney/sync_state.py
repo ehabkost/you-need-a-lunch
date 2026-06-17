@@ -81,8 +81,9 @@ class TxnEntry(BaseModel):
     lm_id: int
     split_done: bool = False           # split parents only: True once pass-2 split applied
     ynab_hash: str = ""                # hash of YNAB input fields at last import
-    lm_hash: str = ""                  # hash of LM payload fields at last import
-    lm_recurring: bool = False         # linked to a recurring item (notes excluded from lm_hash)
+    derived_hash: str = ""             # hash of the YNAB-derived LM payload at last import
+                                       # (computed solely from our derivation — never an LM
+                                       # read-back, so it never sees the v2 display-note quirk)
     synced_at: str = ""
 
 
@@ -201,17 +202,10 @@ class SyncState:
         return self._d.transactions.get(ynab_id)
 
     def set_txn(self, ynab_id: str, *, lm_id: int, split_done: bool = False,
-                ynab_hash: str = "", lm_hash: str = "",
-                lm_recurring: bool | None = None) -> None:
-        # lm_recurring=None preserves the existing flag (e.g. on update-apply, which
-        # doesn't re-observe recurring status); pass an explicit bool to set it.
-        if lm_recurring is None:
-            existing = self._d.transactions.get(ynab_id)
-            lm_recurring = existing.lm_recurring if existing else False
+                ynab_hash: str = "", derived_hash: str = "") -> None:
         self._d.transactions[ynab_id] = TxnEntry(
             lm_id=lm_id, split_done=split_done,
-            ynab_hash=ynab_hash, lm_hash=lm_hash,
-            lm_recurring=lm_recurring, synced_at=_now(),
+            ynab_hash=ynab_hash, derived_hash=derived_hash, synced_at=_now(),
         )
 
     def mark_split_done(self, ynab_id: str,
@@ -243,11 +237,6 @@ class SyncState:
 
     def synced_txn_ids(self) -> set[str]:
         return set(self._d.transactions.keys())
-
-    def clear_transactions(self) -> None:
-        """Drop the local txn index (used by --rebuild-index before re-scanning LM)."""
-        self._d.transactions.clear()
-        self._d.txn_index_built = False
 
     @property
     def txn_index_built(self) -> bool:
@@ -300,13 +289,15 @@ def compute_ynab_hash(txn: dict) -> str:
 
 
 def compute_lm_hash(fields: dict) -> str:
-    """Hash the LM payload fields that are written / compared.
+    """Hash the YNAB-derived LM payload fields (the `derived_hash`).
 
-    *fields* must be a plain dict with string keys. Pass either:
-    - insert.model_dump(mode="json", exclude_none=False) at import time, or
-    - a dict extracted from TransactionObject at rebuild time.
-    Date must be an ISO string ("YYYY-MM-DD") in both cases.
-    For split parents, include "split_children" key (see below).
+    Computed *only* from our own derivation (insert_lm_fields), never from an LM
+    read-back — so it never sees the v2 display-note/inherited-value quirks and never
+    needs re-baselining. Used to suppress no-op PUTs when a YNAB change touched only
+    fields we don't map to LM.
+
+    *fields* must be a plain dict with string keys; date must be an ISO string
+    ("YYYY-MM-DD"). For split parents, include the "split_children" key (see below).
     """
     key = {
         "date":        fields.get("date"),

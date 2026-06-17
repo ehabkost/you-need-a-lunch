@@ -43,7 +43,6 @@ class TxnImportOptions:
     since: Optional[date] = None
     opening_balance_category: Optional[int] = None
     deferred_income_as: Optional[str] = None   # "income" | "uncategorized" | "skip"
-    force_ynab: bool = False
 
 
 @dataclass
@@ -393,11 +392,15 @@ UPDATE_BUCKETS = (
     "update_regular",
     "update_split_inplace",
     "update_split_structural",
-    "skipped_no_change",
-    "skipped_lm_edited",
-    "skipped_ynab_unmapped",
-    "skipped_split_no_children",
-    "conflict",
+    "skipped_no_change",          # ynab_hash unchanged — nothing to push
+    "skipped_derived_unchanged",  # ynab_hash changed but only in unmapped fields — refresh hash, no PUT
+    "baseline",                   # no stored ynab_hash (fresh index) — establish baseline, no PUT
+)
+
+UPDATE_ACTION_BUCKETS = (
+    "update_regular",
+    "update_split_inplace",
+    "update_split_structural",
 )
 
 
@@ -413,8 +416,7 @@ class TxnUpdateItem:
     ynab_sub_ids: Optional[list[str]] = None
     old_sub_ids: Optional[list[str]] = None
     new_ynab_hash: str = ""
-    new_lm_hash: str = ""
-    no_baseline: bool = False   # True when both hashes were empty — change not detected, just applying YNAB
+    new_derived_hash: str = ""
     note: str = ""
 
 
@@ -422,27 +424,23 @@ class TxnUpdateItem:
 class TransactionUpdatePlan:
     items: list[TxnUpdateItem]
     counts: dict[str, int]
-    conflicts: list[TxnUpdateItem]
 
 
 def insert_lm_fields(
     insert: InsertTransactionObject,
     split_children: Optional[list[SplitTransactionObject]] = None,
-    *,
-    lm_recurring: bool = False,
 ) -> dict[str, Any]:
     """Extract the LM payload fields (for hashing/diffing) from the insert we'd send.
 
-    Mirrors sinks.lm_fields_from_transaction (the live-LM side) so the two compare directly.
-    When *lm_recurring*, `notes` is excluded (set to None) because LM's v2 API reports
-    `display_notes` for recurring-linked txns, so it can't be compared — see
-    bugs/recurring-notes-dropped-on-put.md.
+    The YNAB-derived side. Pairs with sinks.lm_fields_from_transaction (the live-LM side):
+    both feed transactions.lm_payload_equal, which owns all LM-side normalization (recurring
+    notes, "[No Payee]", split-child inheritance) so it can change with zero re-baselining.
     """
     d = insert.model_dump(mode="json", exclude_none=False)
     fields: dict[str, Any] = {
         "date": d.get("date"), "amount": d.get("amount"), "payee": d.get("payee"),
         "category_id": d.get("category_id"),
-        "notes": None if lm_recurring else d.get("notes"),
+        "notes": d.get("notes"),
         "status": d.get("status"),
     }
     if split_children:
@@ -457,12 +455,13 @@ def insert_lm_fields(
 def compute_insert_lm_hash(
     insert: InsertTransactionObject,
     split_children: Optional[list[SplitTransactionObject]] = None,
-    *,
-    lm_recurring: bool = False,
 ) -> str:
-    """Compute lm_hash from the InsertTransactionObject that was (or will be) sent."""
+    """Compute the `derived_hash` from the InsertTransactionObject we'd send.
+
+    Purely a function of our own YNAB→LM derivation; never reads LM back.
+    """
     from sync_state import compute_lm_hash
-    return compute_lm_hash(insert_lm_fields(insert, split_children, lm_recurring=lm_recurring))
+    return compute_lm_hash(insert_lm_fields(insert, split_children))
 
 
 def _parent_only_payload(insert: InsertTransactionObject) -> dict[str, Any]:
@@ -480,8 +479,10 @@ def build_transaction_update_plan(
     sync: SyncState,
     options: TxnImportOptions,
 ) -> TransactionUpdatePlan:
-    """Pure. For each YNAB txn already in sync.transactions, decide whether an LM update
-    is needed and what kind. No I/O."""
+    """Pure, offline. For each YNAB txn already in sync.transactions, decide whether an LM
+    update is needed and what kind — using only the stored ``ynab_hash`` (did YNAB change?)
+    and ``derived_hash`` (did that change touch a field we map to LM?). Never reads LM; the
+    explicit ``reconcile`` step is what compares against live LM data. No I/O."""
     from sync_state import compute_ynab_hash
     accts_by_id = {a["id"]: a for a in ynab_accounts}
     items: list[TxnUpdateItem] = []
@@ -499,63 +500,34 @@ def build_transaction_update_plan(
         if classified.insert is None:
             continue
 
-        new_lm_hash = compute_insert_lm_hash(
-            classified.insert, classified.split_children,
-            lm_recurring=getattr(entry, "lm_recurring", False),
-        )
+        new_derived_hash = compute_insert_lm_hash(
+            classified.insert, classified.split_children)
         stored_ynab = entry.ynab_hash
-        stored_lm   = entry.lm_hash
+        stored_derived = getattr(entry, "derived_hash", "")
 
-        ynab_changed = stored_ynab != "" and stored_ynab != current_ynab_hash
-        lm_changed   = stored_lm   != "" and stored_lm   != new_lm_hash
-        both_unknown = stored_ynab == "" and stored_lm == ""
+        if stored_ynab == "":
+            # Fresh index (no YNAB baseline): assume LM already reflects YNAB and record
+            # the baseline without writing. Genuine drift is surfaced by `reconcile`.
+            items.append(TxnUpdateItem(
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="baseline",
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
+            ))
+            continue
 
-        no_baseline = both_unknown
-        if both_unknown:
-            # No baseline: can't protect LM edits either way, so apply YNAB data.
-            ynab_changed = True
-            lm_changed = True
-
-        if stored_ynab == "" and stored_lm != "":
-            # Post-rebuild: lm_hash known, ynab_hash unknown
-            if not lm_changed:
-                items.append(TxnUpdateItem(
-                    ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
-                    new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                ))
-                continue
-            # lm_hash changed — treat as YNAB change (one-way sync guarantee suspended post-rebuild)
-            ynab_changed = True
-
-        if not ynab_changed and not lm_changed:
+        if stored_ynab == current_ynab_hash:
             items.append(TxnUpdateItem(
                 ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_no_change",
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
             ))
             continue
 
-        if not ynab_changed and lm_changed:
+        # YNAB changed. If the YNAB-derived LM payload is unchanged, the change touched
+        # only fields we don't map to LM — refresh the baseline, issue no PUT.
+        if stored_derived != "" and stored_derived == new_derived_hash:
             items.append(TxnUpdateItem(
-                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_lm_edited",
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                note="LM was edited directly — not overwriting",
-            ))
-            continue
-
-        if ynab_changed and not lm_changed:
-            items.append(TxnUpdateItem(
-                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_ynab_unmapped",
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                note="YNAB changed in a field we don't map to LM",
-            ))
-            continue
-
-        # Both changed
-        if stored_ynab != "" and stored_lm != "" and not options.force_ynab:
-            items.append(TxnUpdateItem(
-                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="conflict",
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                note="both YNAB and LM changed since last import",
+                ynab_id=ynab_id, lm_id=entry.lm_id, bucket="skipped_derived_unchanged",
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
+                note="YNAB changed only in unmapped fields",
             ))
             continue
 
@@ -568,8 +540,7 @@ def build_transaction_update_plan(
             items.append(TxnUpdateItem(
                 ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_regular",
                 payload=insert_dict,
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                no_baseline=no_baseline,
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
             ))
             continue
 
@@ -586,8 +557,7 @@ def build_transaction_update_plan(
                 new_children=classified.split_children,
                 ynab_sub_ids=[s["id"] for s in subs],
                 old_sub_ids=[],
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                no_baseline=no_baseline,
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
                 note="no child map (post-rebuild) — unsplit+resplit",
             ))
             continue
@@ -600,8 +570,7 @@ def build_transaction_update_plan(
                 new_children=classified.split_children,
                 ynab_sub_ids=[s["id"] for s in subs],
                 old_sub_ids=list(known_sub_ids),
-                new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-                no_baseline=no_baseline,
+                new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
                 note="sub structure changed",
             ))
             continue
@@ -628,10 +597,144 @@ def build_transaction_update_plan(
             ynab_id=ynab_id, lm_id=entry.lm_id, bucket="update_split_inplace",
             parent_payload=parent_payload,
             child_updates=child_updates,
-            new_ynab_hash=current_ynab_hash, new_lm_hash=new_lm_hash,
-            no_baseline=no_baseline,
+            new_ynab_hash=current_ynab_hash, new_derived_hash=new_derived_hash,
         ))
 
     counts = {b: sum(1 for i in items if i.bucket == b) for b in UPDATE_BUCKETS}
-    conflicts = [i for i in items if i.bucket == "conflict"]
-    return TransactionUpdatePlan(items=items, counts=counts, conflicts=conflicts)
+    return TransactionUpdatePlan(items=items, counts=counts)
+
+
+# ── Reconcile: compare YNAB-derived payload against a live LM snapshot ─────────
+#
+# This is the ONLY place that compares against LM-read data, and the ONLY place LM-side
+# normalization lives. It works on full field values (not hashes), so the rules below can
+# change freely with zero re-baselining. The snapshot dicts come from
+# sinks.lm_fields_from_transaction; the derived dicts from insert_lm_fields.
+
+_LM_NO_PAYEE = "[No Payee]"
+
+
+def _norm_snapshot_payee(p: Any) -> Any:
+    """LM stores the literal "[No Payee]" (and sometimes "") where we send None."""
+    return None if p in (None, "", _LM_NO_PAYEE) else p
+
+
+def _child_norm_derived(c: dict[str, Any]) -> dict[str, Any]:
+    return {"amount": c.get("amount"), "category_id": c.get("category_id"),
+            "payee": c.get("payee") or None, "notes": c.get("notes") or None}
+
+
+def _child_norm_snapshot(c: dict[str, Any], parent_payee: Any,
+                         parent_notes: Any) -> dict[str, Any]:
+    # A split child whose snapshot payee/notes equals the parent's is *inheriting* it
+    # (a v2 display quirk); our re-derived children carry None there. Normalize to match.
+    payee = _norm_snapshot_payee(c.get("payee"))
+    if payee == _norm_snapshot_payee(parent_payee):
+        payee = None
+    notes = c.get("notes")
+    if notes == parent_notes:
+        notes = None
+    return {"amount": c.get("amount"), "category_id": c.get("category_id"),
+            "payee": payee, "notes": notes or None}
+
+
+def _child_key(c: dict[str, Any]) -> str:
+    import json as _j
+    return _j.dumps(c, sort_keys=True)
+
+
+def lm_payload_diffs(derived: dict[str, Any],
+                     snapshot: dict[str, Any]) -> list[tuple[str, Any, Any]]:
+    """Field-level differences between our YNAB-derived payload and an LM snapshot.
+
+    Returns a list of (field, snapshot_value, derived_value). Empty list ⇒ LM matches YNAB.
+    Normalization rules (all LM-side quirks live here):
+      - recurring-linked txns: exclude `notes`/`payee` (v2 returns inherited display values)
+      - "[No Payee]" / "" ≡ None
+      - split children inheriting the parent's payee/notes ≡ None (compared as a multiset;
+        `amount`/`category_id` compared strictly)
+    """
+    recurring = bool(snapshot.get("recurring"))
+    diffs: list[tuple[str, Any, Any]] = []
+
+    for k in ("date", "amount", "category_id", "status"):
+        if derived.get(k) != snapshot.get(k):
+            diffs.append((k, snapshot.get(k), derived.get(k)))
+
+    if not recurring:
+        snap_payee = _norm_snapshot_payee(snapshot.get("payee"))
+        if (derived.get("payee") or None) != snap_payee:
+            diffs.append(("payee", snapshot.get("payee"), derived.get("payee")))
+        if (derived.get("notes") or None) != (snapshot.get("notes") or None):
+            diffs.append(("notes", snapshot.get("notes"), derived.get("notes")))
+
+    dch = derived.get("split_children") or []
+    sch = snapshot.get("split_children") or []
+    if len(dch) != len(sch):
+        diffs.append(("split_children", sch, dch))
+    elif dch:
+        parent_payee = snapshot.get("payee")
+        parent_notes = snapshot.get("notes")
+        dnorm = sorted((_child_norm_derived(c) for c in dch), key=_child_key)
+        snorm = sorted((_child_norm_snapshot(c, parent_payee, parent_notes) for c in sch),
+                       key=_child_key)
+        if dnorm != snorm:
+            diffs.append(("split_children", snorm, dnorm))
+
+    return diffs
+
+
+def lm_payload_equal(derived: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    return not lm_payload_diffs(derived, snapshot)
+
+
+@dataclass
+class ReconcileReport:
+    examined: int                                    # mapped txns found in the snapshot
+    unmatched: int                                   # mapped txns NOT found in the snapshot
+    field_tally: dict[str, int]                      # field -> count of txns differing in it
+    examples: dict[str, list[tuple[str, Any, Any]]]  # field -> [(ynab_id, snap, derived), ...]
+    differing_ids: list[str]                         # ynab_ids where LM differs from YNAB
+
+
+def build_reconcile_report(
+    ynab_txns: list[dict[str, Any]],
+    ynab_accounts: list[dict[str, Any]],
+    snapshot_by_ynab_id: dict[str, dict[str, Any]],
+    *,
+    sync: SyncState,
+    options: TxnImportOptions,
+) -> ReconcileReport:
+    """Pure. Compare every mapped YNAB txn's derived payload against the LM snapshot
+    (dicts from sinks.lm_fields_from_transaction, keyed by ynab_id)."""
+    accts_by_id = {a["id"]: a for a in ynab_accounts}
+    field_tally: dict[str, int] = {}
+    examples: dict[str, list[tuple[str, Any, Any]]] = {}
+    differing_ids: list[str] = []
+    examined = unmatched = 0
+
+    for txn in ynab_txns:
+        ynab_id = txn["id"]
+        if sync.txn(ynab_id) is None or txn.get("deleted"):
+            continue
+        snapshot = snapshot_by_ynab_id.get(ynab_id)
+        if snapshot is None:
+            unmatched += 1
+            continue
+        classified = _classify_txn(txn, accts_by_id, sync, options)
+        if classified.insert is None:
+            continue
+        examined += 1
+        derived = insert_lm_fields(classified.insert, classified.split_children)
+        diffs = lm_payload_diffs(derived, snapshot)
+        if diffs:
+            differing_ids.append(ynab_id)
+            for field_name, old, new in diffs:
+                field_tally[field_name] = field_tally.get(field_name, 0) + 1
+                ex = examples.setdefault(field_name, [])
+                if len(ex) < 10:
+                    ex.append((ynab_id, old, new))
+
+    return ReconcileReport(examined=examined, unmatched=unmatched,
+                           field_tally=field_tally, examples=examples,
+                           differing_ids=differing_ids)

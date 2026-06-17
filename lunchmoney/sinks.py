@@ -20,26 +20,24 @@ class ScannedTxn:
     ynab_id: str
     lm_id: int
     split_done: bool = False
-    lm_hash: str = ""
     child_map: dict[str, int] = field(default_factory=dict)  # sub_ynab_id -> child_lm_id
-    lm_recurring: bool = False  # linked to a recurring item (v2 `notes` is then display-only)
 
 
 def lm_fields_from_transaction(t: TransactionObject) -> dict[str, Any]:
-    """Extract the LM payload fields used for hashing/diffing from a live LM transaction.
+    """Extract the LM payload fields used for reconcile-diffing from a live LM transaction.
 
-    Must stay in sync with transactions.insert_lm_fields (the YNAB-derived side) so the
-    two are directly comparable.
+    Pairs with transactions.insert_lm_fields (the YNAB-derived side); both feed
+    transactions.lm_payload_diffs, which owns all normalization. We pass `notes`/`payee`
+    through raw and flag `recurring` so the comparator can exclude them when the v2 API
+    is returning inherited display values (see bugs/recurring-notes-*).
     """
     date_str = t.date.isoformat() if hasattr(t.date, "isoformat") else str(t.date)
     fields: dict[str, Any] = {
         "date": date_str, "amount": t.amount, "payee": t.payee,
         "category_id": t.category_id,
-        # For recurring-linked txns the v2 API returns `display_notes` (the recurring
-        # item's description) in `notes`, not the stored per-transaction note — so it's
-        # unreliable for diffing. Exclude it from the hash (see bugs/recurring-notes-*).
-        "notes": None if t.recurring_id is not None else t.notes,
+        "notes": t.notes,
         "status": t.status.value if hasattr(t.status, "value") else t.status,
+        "recurring": t.recurring_id is not None,
     }
     if t.is_split_parent and t.children:
         fields["split_children"] = [
@@ -56,17 +54,13 @@ def scanned_from_transactions(txns: list[TransactionObject]) -> list[ScannedTxn]
     Only transactions carrying custom_metadata.ynab_id (i.e. imported by this tool)
     are kept. Split children carry no ynab_id and are ignored.
     """
-    from sync_state import compute_lm_hash
     result: list[ScannedTxn] = []
     for t in txns:
         ynab_id = (t.custom_metadata or {}).get("ynab_id")
         if not ynab_id:
             continue
-        lm_hash = compute_lm_hash(lm_fields_from_transaction(t))
         result.append(ScannedTxn(ynab_id=str(ynab_id), lm_id=t.id,
-                                 split_done=bool(t.is_split_parent),
-                                 lm_hash=lm_hash,
-                                 lm_recurring=t.recurring_id is not None))
+                                 split_done=bool(t.is_split_parent)))
     return result
 
 
@@ -76,7 +70,6 @@ class InsertResult:
     skipped: int
     skipped_reasons: dict[str, int]            # Reason.value -> count
     id_by_external: dict[str, int] = field(default_factory=dict)  # ynab_id -> LM txn id
-    recurring_external: set[str] = field(default_factory=set)     # ynab_ids LM linked to a recurring item
 
 
 class TransactionSink(Protocol):
@@ -114,7 +107,7 @@ class ApiSink:
         """Save a full LM snapshot to *out_dir* and return the already-imported index.
 
         Fetches LM data once (via export.fetch_all) and reuses the transactions to
-        build the index, so --rebuild-index doesn't pull transactions twice.
+        build the index, so `reconcile` doesn't pull transactions twice.
         """
         from export import write_export, fetch_all
         snapshot = fetch_all(self._client)
@@ -127,12 +120,9 @@ class ApiSink:
         resp = self._client.insert_transactions(txns)
         reasons: dict[str, int] = {}
         id_by_external: dict[str, int] = {}
-        recurring_external: set[str] = set()
         for t in resp.transactions:
             if t.external_id and t.id is not None:
                 id_by_external[t.external_id] = t.id
-                if t.recurring_id is not None:
-                    recurring_external.add(t.external_id)
         for skip in resp.skipped_duplicates:
             key = skip.reason.value if skip.reason else "unknown"
             reasons[key] = reasons.get(key, 0) + 1
@@ -145,7 +135,6 @@ class ApiSink:
             skipped=len(resp.skipped_duplicates),
             skipped_reasons=reasons,
             id_by_external=id_by_external,
-            recurring_external=recurring_external,
         )
 
     def split(self, parent_lm_id: int, children: list[SplitTransactionObject]) -> list[int]:

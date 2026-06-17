@@ -16,7 +16,7 @@ from sync_state import (
 )
 from transactions import (
     TxnImportOptions, build_transaction_update_plan, TxnUpdateItem,
-    compute_insert_lm_hash,
+    compute_insert_lm_hash, build_reconcile_report, lm_payload_equal,
 )
 from lm_api_types_generated import InsertTransactionObject, SplitTransactionObject
 from sinks import InsertResult
@@ -365,44 +365,32 @@ def test_no_change_skips():
     assert plan.items[0].bucket == "skipped_no_change"
 
 
-def test_lm_edited_skips_and_does_not_overwrite():
+def test_ynab_changed_unmapped_field_skips_via_derived_hash():
+    """YNAB changed (ynab_hash differs) but the derived LM payload is identical — the change
+    touched only fields we don't map. Refresh the baseline, issue no PUT."""
     txn = make_ynab_txn()
-    yh, _ = _stored_hashes(txn)
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": yh, "lm_hash": "different"}})
+    _, dh = _stored_hashes(txn)
+    sync = make_sync(transactions={
+        "txn-1": {"lm_id": 10, "ynab_hash": "old-hash", "derived_hash": dh}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "skipped_lm_edited"
+    assert plan.items[0].bucket == "skipped_derived_unchanged"
+    assert plan.items[0].new_ynab_hash == compute_ynab_hash(txn)
 
 
-def test_ynab_changed_unmapped_field_skips():
+def test_ynab_changed_mapped_field_updates():
+    """YNAB changed and the derived payload also changed — a real update."""
     txn = make_ynab_txn()
-    _, lh = _stored_hashes(txn)
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old-hash", "lm_hash": lh}})
+    sync = make_sync(transactions={
+        "txn-1": {"lm_id": 10, "ynab_hash": "old-yh", "derived_hash": "old-dh"}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "skipped_ynab_unmapped"
-
-
-def test_both_changed_is_conflict():
-    txn = make_ynab_txn()
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old-yh", "lm_hash": "old-lh"}})
-    plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "conflict"
-    assert len(plan.conflicts) == 1
-
-
-def test_both_changed_force_ynab_updates():
-    txn = make_ynab_txn()
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old-yh", "lm_hash": "old-lh"}})
-    plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
     assert plan.items[0].bucket == "update_regular"
-    assert len(plan.conflicts) == 0
 
 
 def test_regular_txn_update_payload_excludes_external_id():
     txn = make_ynab_txn()
     sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old", "lm_hash": "old"}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_regular"
     assert "external_id" not in (plan.items[0].payload or {})
 
@@ -411,7 +399,7 @@ def test_regular_txn_update_payload_excludes_account_id():
     txn = make_ynab_txn()
     sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old", "lm_hash": "old"}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     payload = plan.items[0].payload or {}
     assert "manual_account_id" not in payload
     assert "plaid_account_id" not in payload
@@ -421,7 +409,7 @@ def test_regular_txn_update_payload_excludes_currency():
     txn = make_ynab_txn()
     sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "old", "lm_hash": "old"}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert "currency" not in (plan.items[0].payload or {})
 
 
@@ -433,7 +421,7 @@ def test_split_inplace_when_sub_ids_unchanged():
         split_children={"s1": 100, "s2": 101},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_inplace"
     assert plan.items[0].child_updates is not None
 
@@ -447,7 +435,7 @@ def test_split_structural_when_sub_added():
         split_children={"s1": 100},  # s2 is new — not in map
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_structural"
 
 
@@ -460,7 +448,7 @@ def test_split_structural_when_sub_removed():
         split_children={"s1": 100, "s2": 101},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     # After filtering deleted subs, only s1 remains; s2 mapping still exists
     # but s2 is not in current_sub_ids, so it's not in known_sub_ids either.
     # Result: inplace (s1 is the only current sub and is known)
@@ -475,35 +463,44 @@ def test_split_structural_when_no_child_map():
         split_children={},  # no child map
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_structural"
     assert plan.items[0].note == "no child map (post-rebuild) — unsplit+resplit"
 
 
-def test_both_hashes_empty_applies_ynab_data():
-    # No baseline: can't protect LM edits, so apply YNAB data unconditionally.
+def test_empty_ynab_hash_records_baseline_no_write():
+    """Fresh index (no stored ynab_hash): record a baseline, issue no LM write,
+    regardless of whether the derived payload looks different."""
     txn = make_ynab_txn()
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "lm_hash": ""}})
+    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "derived_hash": ""}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "update_regular"
+    assert plan.items[0].bucket == "baseline"
     assert plan.items[0].new_ynab_hash != ""
-    assert plan.items[0].new_lm_hash != ""
+    assert plan.items[0].new_derived_hash != ""
 
 
-def test_ynab_hash_empty_lm_hash_changed_treated_as_ynab_change():
+def test_baseline_apply_stores_hashes_without_sink_calls():
     txn = make_ynab_txn()
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "lm_hash": "old-lm"}})
+    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "derived_hash": ""}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    # lm_hash doesn't match current — post-rebuild treat as YNAB change → update
-    assert plan.items[0].bucket in ("update_regular", "update_split_inplace", "update_split_structural")
+    sink = FakeSink()
+    _run_apply(plan, sink, sync)
+    assert sink.calls == []
+    entry = sync.txn("txn-1")
+    assert entry.ynab_hash == compute_ynab_hash(txn)
+    assert entry.derived_hash != ""
 
 
-def test_ynab_hash_empty_lm_hash_unchanged_skips():
+def test_derived_unchanged_apply_refreshes_ynab_hash_without_sink_calls():
     txn = make_ynab_txn()
-    _, lh = _stored_hashes(txn)
-    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "", "lm_hash": lh}})
+    _, dh = _stored_hashes(txn)
+    sync = make_sync(transactions={
+        "txn-1": {"lm_id": 10, "ynab_hash": "old-hash", "derived_hash": dh}})
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "skipped_no_change"
+    sink = FakeSink()
+    _run_apply(plan, sink, sync)
+    assert sink.calls == []
+    assert sync.txn("txn-1").ynab_hash == compute_ynab_hash(txn)
 
 
 # ── Structural update crash resistance ────────────────────────────────────────
@@ -521,7 +518,7 @@ def _make_structural_update_plan() -> tuple[object, SyncState]:
         split_children={"s1": 100},  # s1 is known, s2 is new
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_structural"
     assert plan.items[0].old_sub_ids == ["s1"]
     return plan, sync
@@ -563,7 +560,7 @@ def test_structural_crash_after_step_A():
     sink2 = FakeSink(already_unsplit=False)
     txn = make_split_ynab_txn("p1", new_subs)
     plan2 = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                           options=_options(force_ynab=True))
+                                           options=_options())
     _run_apply(plan2, sink2, sync)
 
     assert sync.txn("p1").split_done is True
@@ -590,7 +587,7 @@ def test_structural_crash_after_step_B():
     sink2 = FakeSink(already_unsplit=True)
     txn = make_split_ynab_txn("p1", new_subs)
     plan2 = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                           options=_options(force_ynab=True))
+                                           options=_options())
     _run_apply(plan2, sink2, sync)
 
     assert sync.txn("p1").split_done is True
@@ -610,7 +607,7 @@ def test_structural_crash_after_step_D():
         split_children={"s1": 100},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_structural"
     assert plan.items[0].parent_payload is not None  # ensures call order: unsplit(0), update(1), split(2)
 
@@ -627,7 +624,7 @@ def test_structural_crash_after_step_D():
     # LM is unsplit (step B done, step D never completed), so already_unsplit=True
     sink2 = FakeSink(already_unsplit=True)
     plan2 = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                           options=_options(force_ynab=True))
+                                           options=_options())
     _run_apply(plan2, sink2, sync)
 
     assert sync.txn("p1").split_done is True
@@ -646,7 +643,7 @@ def test_structural_idempotent_full_run():
 
     sink = FakeSink()
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     _run_apply(plan, sink, sync)
 
     assert sync.txn("p1").split_done is True
@@ -655,7 +652,7 @@ def test_structural_idempotent_full_run():
     # Second run: hashes now match, no changes
     sink2 = FakeSink()
     plan2 = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                           options=_options(force_ynab=True))
+                                           options=_options())
     _run_apply(plan2, sink2, sync)
 
     assert sink2.calls == [], f"Second run should make no API calls, got: {sink2.calls}"
@@ -669,7 +666,7 @@ def test_structural_old_sub_ids_cleared_from_split_children():
         split_children={"s1": 100},  # s1 old, s2 new
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_structural"
     sink = FakeSink()
     _run_apply(plan, sink, sync)
@@ -688,7 +685,7 @@ def test_structural_all_new_subs_recorded():
         split_children={"s1": 100},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     sink = FakeSink()
     _run_apply(plan, sink, sync)
 
@@ -705,7 +702,7 @@ def test_structural_child_lm_ids_differ_from_old():
         split_children={"s1": 100},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     sink = FakeSink()
     _run_apply(plan, sink, sync)
 
@@ -725,7 +722,7 @@ def test_inplace_parent_and_all_children_updated():
         split_children={"s1": 100, "s2": 101},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
     assert plan.items[0].bucket == "update_split_inplace"
 
     sink = FakeSink()
@@ -736,12 +733,12 @@ def test_inplace_parent_and_all_children_updated():
 
     entry = sync.txn("p1")
     assert entry.ynab_hash != "old"
-    assert entry.lm_hash != "old"
+    assert entry.derived_hash != "old"
 
 
-def test_recurring_readback_excludes_notes_from_lm_hash():
-    """sinks.lm_fields_from_transaction must drop `notes` when the live txn is recurring
-    (v2 returns display_notes there), but keep it otherwise."""
+def test_reconcile_extractor_passes_notes_and_recurring_flag():
+    """sinks.lm_fields_from_transaction passes `notes` through raw and flags `recurring`;
+    the comparator (not the extractor) decides whether to exclude notes."""
     from datetime import date as date_cls
     from sinks import lm_fields_from_transaction
     from lm_api_types_generated import TransactionObject
@@ -754,39 +751,60 @@ def test_recurring_readback_excludes_notes_from_lm_hash():
             is_split_parent=False, children=None,
         )
 
-    assert lm_fields_from_transaction(_txn(None))["notes"] == "my memo"
-    assert lm_fields_from_transaction(_txn(2869334))["notes"] is None
+    plain = lm_fields_from_transaction(_txn(None))
+    rec = lm_fields_from_transaction(_txn(2869334))
+    assert plain["notes"] == "my memo" and plain["recurring"] is False
+    assert rec["notes"] == "my memo" and rec["recurring"] is True
 
 
-def test_recurring_txn_with_memo_no_phantom_update():
-    """A recurring-linked txn whose YNAB memo is unchanged must NOT be re-flagged for
-    update, even though v2 reads its notes back as null (option (b): notes excluded from
-    the lm_hash when lm_recurring)."""
-    from datetime import date as date_cls
-    txn = make_ynab_txn(memo="monthly subscription note")
-    yh = compute_ynab_hash(txn)
-    insert = InsertTransactionObject(
-        date=date_cls.fromisoformat(txn["date"]),
-        amount=f"{-txn['amount'] / 1000:.4f}", payee=txn.get("payee_name"),
-        category_id=CAT_LM_ID, notes=txn["memo"], status="reviewed",
-        manual_account_id=101, external_id=txn["id"],
-        custom_metadata={"ynab_id": txn["id"]},
-    )
-    # Stored lm_hash as recorded for a recurring txn: notes excluded.
-    lh = compute_insert_lm_hash(insert, lm_recurring=True)
-    sync = make_sync(transactions={"txn-1": {
-        "lm_id": 10, "ynab_hash": yh, "lm_hash": lh, "lm_recurring": True}})
+def test_reconcile_comparator_excludes_notes_for_recurring():
+    """lm_payload_equal must treat a recurring-linked snapshot as matching even when its
+    notes (the v2 display value) differ from our derived per-txn notes."""
+    from transactions import lm_payload_equal
+    derived = {"date": "2024-01-15", "amount": "-50.0000", "payee": "Supermarket",
+               "category_id": CAT_LM_ID, "notes": "monthly subscription note",
+               "status": "reviewed"}
+    snap_recurring = {**derived, "notes": "Netflix (display)", "recurring": True}
+    snap_plain = {**derived, "notes": "Netflix (display)", "recurring": False}
+    assert lm_payload_equal(derived, snap_recurring) is True   # notes excluded
+    assert lm_payload_equal(derived, snap_plain) is False       # notes compared → differ
 
-    plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync, options=_options())
-    assert plan.items[0].bucket == "skipped_no_change"
 
-    # Sanity: without the recurring flag the same stored hash WOULD look like a change
-    # (this is the phantom-update bug the flag fixes).
-    sync_buggy = make_sync(transactions={"txn-1": {
-        "lm_id": 10, "ynab_hash": yh, "lm_hash": lh, "lm_recurring": False}})
-    plan_buggy = build_transaction_update_plan([txn], ynab_accounts(), sync=sync_buggy,
-                                               options=_options())
-    assert plan_buggy.items[0].bucket != "skipped_no_change"
+def test_reconcile_comparator_no_payee_equals_none():
+    from transactions import lm_payload_equal
+    derived = {"date": "2024-01-15", "amount": "-1.0000", "payee": None,
+               "category_id": CAT_LM_ID, "notes": None, "status": "reviewed"}
+    snap = {**derived, "payee": "[No Payee]", "recurring": False}
+    assert lm_payload_equal(derived, snap) is True
+
+
+def test_reconcile_comparator_split_child_inherits_parent_payee():
+    """A snapshot split child whose payee/notes equals the parent's is inheriting it (v2
+    display quirk); our derived children carry None there, and they must compare equal."""
+    from transactions import lm_payload_equal
+    derived = {
+        "date": "2024-01-15", "amount": "-50.0000", "payee": "IKEA",
+        "category_id": None, "notes": None, "status": "reviewed",
+        "split_children": [
+            {"amount": "-30.0000", "category_id": 1, "payee": None, "notes": None},
+            {"amount": "-20.0000", "category_id": 2, "payee": None, "notes": None},
+        ],
+    }
+    snap = {
+        "date": "2024-01-15", "amount": "-50.0000", "payee": "IKEA",
+        "category_id": None, "notes": None, "status": "reviewed", "recurring": False,
+        "split_children": [
+            {"amount": "-30.0000", "category_id": 1, "payee": "IKEA", "notes": None},
+            {"amount": "-20.0000", "category_id": 2, "payee": "IKEA", "notes": None},
+        ],
+    }
+    assert lm_payload_equal(derived, snap) is True
+    # A genuine child category change is still detected.
+    snap_diff = {**snap, "split_children": [
+        {"amount": "-30.0000", "category_id": 999, "payee": "IKEA", "notes": None},
+        {"amount": "-20.0000", "category_id": 2, "payee": "IKEA", "notes": None},
+    ]}
+    assert lm_payload_equal(derived, snap_diff) is False
 
 
 def test_inplace_does_not_touch_split_children_map():
@@ -797,10 +815,51 @@ def test_inplace_does_not_touch_split_children_map():
         split_children={"s1": 100, "s2": 101},
     )
     plan = build_transaction_update_plan([txn], ynab_accounts(), sync=sync,
-                                          options=_options(force_ynab=True))
+                                          options=_options())
 
     sink = FakeSink()
     _run_apply(plan, sink, sync)
 
     assert sync.split_child_lm_id("s1") == 100
     assert sync.split_child_lm_id("s2") == 101
+
+
+# ── Reconcile report ──────────────────────────────────────────────────────────
+
+def _snapshot_fields(txn: dict, *, amount: str, recurring: bool = False) -> dict:
+    """A minimal sinks.lm_fields_from_transaction-shaped snapshot dict for one txn."""
+    return {
+        "date": txn["date"], "amount": amount,
+        "payee": txn.get("payee_name"),
+        "category_id": CAT_LM_ID if txn.get("category_id") == CAT_ID else None,
+        "notes": txn.get("memo") or None,
+        "status": "reviewed" if txn.get("approved") else "unreviewed",
+        "recurring": recurring,
+    }
+
+
+def test_reconcile_report_flags_amount_drift():
+    txn = make_ynab_txn(amount=-50000)  # derived amount "50.0000"
+    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "x"}})
+    # LM snapshot has a stale amount.
+    snap = {"txn-1": _snapshot_fields(txn, amount="49.0000")}
+    report = build_reconcile_report([txn], ynab_accounts(), snap, sync=sync, options=_options())
+    assert report.examined == 1
+    assert report.unmatched == 0
+    assert report.differing_ids == ["txn-1"]
+    assert report.field_tally.get("amount") == 1
+
+
+def test_reconcile_report_clean_when_matching():
+    txn = make_ynab_txn(amount=-50000)
+    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "x"}})
+    snap = {"txn-1": _snapshot_fields(txn, amount="50.0000")}
+    report = build_reconcile_report([txn], ynab_accounts(), snap, sync=sync, options=_options())
+    assert report.examined == 1 and not report.field_tally and report.differing_ids == []
+
+
+def test_reconcile_report_counts_unmatched():
+    txn = make_ynab_txn()
+    sync = make_sync(transactions={"txn-1": {"lm_id": 10, "ynab_hash": "x"}})
+    report = build_reconcile_report([txn], ynab_accounts(), {}, sync=sync, options=_options())
+    assert report.examined == 0 and report.unmatched == 1

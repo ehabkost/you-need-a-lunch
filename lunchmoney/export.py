@@ -1,9 +1,9 @@
 """Export all Lunch Money data to a local directory.
 
 Writes a faithful snapshot of the LM side (manual accounts, plaid accounts,
-categories, and every transaction) as JSON files. Used by `import --rebuild-index`
-to save the LM data it already fetches while rebuilding the local txn index, so
-the snapshot lands beside the sync state in data/<slug>/<lm_account_id>/.
+categories, and every transaction) as JSON files. Used by `import reconcile`
+to save the LM data it fetches while refreshing the local txn index, so the
+snapshot lands beside the sync state in data/<slug>/<lm_account_id>/.
 
 Files written (one JSON array each):
   manual_accounts.json

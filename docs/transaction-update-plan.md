@@ -22,6 +22,16 @@ Companion docs:
 
 ## Revision 2 (2026-06-12): drop `lm_hash`, split sync from reconcile
 
+> **✅ Implemented 2026-06-16.** `TxnEntry` now carries `ynab_hash` + `derived_hash` (no
+> `lm_hash`/`lm_recurring`). `import` is offline (decides on those two hashes; first run still
+> bootstraps the id-map from LM, then never reads it again). LM read-back moved to a new
+> read-only `reconcile` subcommand, which refreshes the snapshot + id-map and reports drift
+> via `lm_payload_diffs` (the single normalizing comparator: recurring notes/payee, `"[No
+> Payee]"`, split-child inheritance). Resolved open decisions: `reconcile` subcommand (not a
+> flag); report-only (no auto-fix); `derived_hash` no-op-PUT suppression kept; conflict guard
+> dropped from sync. The two-hash design below is retained only for `ynab_hash`, split-update
+> mechanics, and crash ordering.
+
 ### Why
 
 `lm_hash` tried to answer "does LM still have what we'd send?" by storing a fingerprint and
