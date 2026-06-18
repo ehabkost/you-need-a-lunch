@@ -103,11 +103,62 @@ def merge_by_id(existing: list, delta: list, key="id") -> tuple[list, int, int]:
     return list(index.values()), updated, added
 
 
+def merge_categories(existing_groups: list, delta_groups: list) -> tuple[list, int, int]:
+    """Merge a YNAB categories delta. Counts/returns are at the *category* level.
+
+    Categories are nested inside groups, and YNAB's delta returns each changed group as a
+    container carrying ONLY its changed categories — so replacing whole groups (as merge_by_id
+    would) silently drops every unchanged sibling. Instead, upsert by category id and re-nest
+    each category under its current category_group_id, which also handles category moves and
+    deletions (deleted categories come back with deleted=True and are kept, per CLAUDE.md).
+    """
+    group_meta: dict = {}   # group_id -> group dict (its .categories is rebuilt below)
+    cats: dict = {}         # category_id -> category dict
+    for g in existing_groups:
+        group_meta[g["id"]] = g
+        for c in g.get("categories", []):
+            cats[c["id"]] = c
+    updated = added = 0
+    for g in delta_groups:
+        group_meta[g["id"]] = g
+        for c in g.get("categories", []):
+            if c["id"] in cats:
+                updated += 1
+            else:
+                added += 1
+            cats[c["id"]] = c
+    # Re-nest categories under their current group.
+    by_group: dict = {}
+    for c in cats.values():
+        by_group.setdefault(c.get("category_group_id"), []).append(c)
+    merged = []
+    for gid, g in group_meta.items():
+        g = dict(g)
+        g["categories"] = by_group.get(gid, [])
+        merged.append(g)
+    return merged, updated, added
+
+
 # ── export helpers ────────────────────────────────────────────────────────────
 
-def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *, allow_404=False):
-    """Fetch a simple list endpoint, merge with existing, update checkpoint."""
+def _resolve_since(out_dir: Path, name: str, checkpoint: dict, ck_key: str) -> int | None:
+    """Delta cursor for a resource, or None to force a full fetch.
+
+    A stored cursor is only honoured when the on-disk file still exists; if the file is
+    missing we ignore it and re-fetch in full, so deleting <name>.json triggers a clean
+    rebuild of just that resource (other resources keep doing cheap deltas).
+    """
     since = checkpoint.get(ck_key)
+    if since is not None and not (out_dir / f"{name}.json").exists():
+        print(f"  ({name}.json missing — full re-fetch)")
+        return None
+    return since
+
+
+def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *,
+                 allow_404=False, merge_fn=merge_by_id):
+    """Fetch a simple list endpoint, merge with existing, update checkpoint."""
+    since = _resolve_since(out_dir, name, checkpoint, ck_key)
     resp = client.get(path, since=since, allow_404=allow_404)
     if resp is None:
         print(f"  (not available)")
@@ -118,7 +169,7 @@ def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *, a
 
     if since is not None:
         existing = load_json(out_dir, name)
-        merged, updated, added = merge_by_id(existing, records)
+        merged, updated, added = merge_fn(existing, records)
         save_json(out_dir, name, merged)
         print(f"    {added} added, {updated} updated (was {len(existing)})")
     else:
@@ -130,7 +181,7 @@ def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *, a
 
 def fetch_months(client, budget_id, out_dir, checkpoint):
     """Fetch budget months. Delta only re-fetches months whose summaries changed."""
-    since = checkpoint.get("months")
+    since = _resolve_since(out_dir, "months", checkpoint, "months")
     resp = client.get(f"/budgets/{budget_id}/months", since=since)
     changed_summaries = resp["data"]["months"]
     server_knowledge = resp["data"].get("server_knowledge")
@@ -185,7 +236,7 @@ def run_export(client: YNABClient, budget_id: str, budget: dict, out_dir: Path, 
 
     print("Categories...")
     fetch_simple(client, f"/budgets/{budget_id}/categories", "category_groups",
-                 out_dir, "categories", checkpoint, "categories")
+                 out_dir, "categories", checkpoint, "categories", merge_fn=merge_categories)
 
     print("Transactions...")
     fetch_simple(client, f"/budgets/{budget_id}/transactions", "transactions",
