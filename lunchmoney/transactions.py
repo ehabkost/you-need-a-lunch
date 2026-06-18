@@ -344,8 +344,12 @@ def preflight_check(
     ynab_txns: list[dict[str, Any]],
     ynab_accounts: list[dict[str, Any]],
     sync: SyncState,
+    pending_special_cats: set[str] = frozenset(),
 ) -> list[str]:
-    """Return list of error strings; empty list means pre-flight passed."""
+    """Return list of error strings; empty list means pre-flight passed.
+
+    *pending_special_cats* lists special-category keys that would be created later in the same
+    run (dry-run preview), so they're treated as satisfied rather than aborting."""
     errors: list[str] = []
     accts_by_id = {a["id"]: a for a in ynab_accounts}
 
@@ -356,11 +360,14 @@ def preflight_check(
         for t in ynab_txns if not t.get("deleted")
     )
 
-    if sync.special_cat_id("payment_transfer") is None:
+    def _missing_special(key: str) -> bool:
+        return sync.special_cat_id(key) is None and key not in pending_special_cats
+
+    if _missing_special("payment_transfer"):
         errors.append("Special category 'Payment, Transfer' not in sync_state — run import categories first")
-    if has_off_budget and sync.special_cat_id("tracking_off_budget") is None:
+    if has_off_budget and _missing_special("tracking_off_budget"):
         errors.append("Special category 'Tracking (off-budget)' required but not in sync_state")
-    if has_splits and sync.special_cat_id("incomplete_split") is None:
+    if has_splits and _missing_special("incomplete_split"):
         errors.append("Special category 'Incomplete Split' required for split transactions but not in sync_state")
 
     # Check every non-deleted txn's account is in sync_state

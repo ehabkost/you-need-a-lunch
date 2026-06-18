@@ -123,6 +123,25 @@ class SyncStateData(BaseModel):
 class SyncState:
     def __init__(self, data: SyncStateData):
         self._d = data
+        # Keys registered for dry-run preview only: visible to lookups during this run so
+        # later phases can plan against would-be-created entities, but stripped from save()
+        # so a dry-run never mutates sync_state.json on disk.
+        self._provisional: dict[str, set[str]] = {
+            "accounts": set(), "categories": set(),
+            "category_groups": set(), "special_categories": set(),
+        }
+
+    def mark_provisional(self, kind: str, key: str) -> None:
+        """Tag an in-memory entry (account/category/category_group/special_categories key)
+        as provisional. Provisional entries are returned by lookups this run but are never
+        written to disk by save(). A key may be marked without a backing entry (e.g. a special
+        category that's pending creation and has no id yet) — see provisional_special_cats."""
+        self._provisional[kind].add(key)
+
+    def provisional_special_cats(self) -> set[str]:
+        """Special-category keys marked pending this run (dry-run preview). Pre-flight treats
+        these as satisfied so it doesn't abort on categories that would be created this run."""
+        return set(self._provisional["special_categories"])
 
     @classmethod
     def load_or_create(cls, data_dir: Path, lm_account_id: int, ynab_budget_id: str,
@@ -144,9 +163,19 @@ class SyncState:
 
     def save(self, sync_dir: Path) -> None:
         self._d.last_updated = _now()
-        (sync_dir / SYNC_STATE_FILE).write_text(
-            self._d.model_dump_json(indent=2)
-        )
+        data = self._d
+        if any(self._provisional.values()):
+            # Drop dry-run preview entries before persisting so they never reach disk.
+            data = data.model_copy(deep=True)
+            for key in self._provisional["accounts"]:
+                data.accounts.pop(key, None)
+            for key in self._provisional["categories"]:
+                data.categories.pop(key, None)
+            for key in self._provisional["category_groups"]:
+                data.category_groups.pop(key, None)
+            for key in self._provisional["special_categories"]:
+                data.special_categories.pop(key, None)
+        (sync_dir / SYNC_STATE_FILE).write_text(data.model_dump_json(indent=2))
 
     # ── accounts ──────────────────────────────────────────────────────────────
 

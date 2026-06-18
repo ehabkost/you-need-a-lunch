@@ -1141,6 +1141,30 @@ def _print_account_plan(plan: list[dict[str, Any]], apply: bool) -> None:
             print(f"      {item['acc']['name']}  → LM Plaid '{item['lm_name']}'")
 
 
+def _register_provisional_accounts(plan: list[dict[str, Any]], sync: SyncState) -> None:
+    """Dry-run preview: register would-be-created/recovered/linked accounts in memory so the
+    transactions phase can bucket their transactions instead of aborting pre-flight.
+
+    No id is fabricated: a not-yet-created account is recorded with ``lm_id=None`` — its real
+    id is resolved from LM only at apply time, when the account actually exists. Recovered and
+    Plaid-linked accounts already have a known LM id, so they use it. Marked provisional so
+    save() never persists these entries. Bucket counts don't depend on the id anyway, only on
+    ``lm_type`` and the account's ``on_budget`` flag (read from YNAB data, not the mapping)."""
+    for item in plan:
+        action, acc = item["action"], item["acc"]
+        if action == _A_CREATE:
+            sync.set_account(acc["id"], lm_type="manual", lm_id=None, lm_name=acc["name"])
+        elif action == _A_RECOVER:
+            sync.set_account(acc["id"], lm_type="manual",
+                             lm_id=item["lm_id"], lm_name=item["lm_name"])
+        elif action == _A_PLAID:
+            sync.set_account(acc["id"], lm_type="plaid",
+                             lm_id=item["lm_id"], lm_name=item["lm_name"])
+        else:
+            continue
+        sync.mark_provisional("accounts", acc["id"])
+
+
 def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
                    meta: dict[str, Any], apply: bool,
                    update_fields: list[str] | None = None,
@@ -1162,6 +1186,7 @@ def phase_accounts(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: 
         return 0
 
     if not apply:
+        _register_provisional_accounts(plan, sync)
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
         return len(actionable)
 
@@ -1472,6 +1497,18 @@ def _mapping_exclude_category(data_dir: Path, lm_id: int) -> None:
         mapping_path.write_text(text)
 
 
+def _mark_pending_special_cats(plan: list[dict[str, Any]], sync: SyncState) -> None:
+    """Dry-run preview: note would-be-created/recovered special categories (payment_transfer,
+    tracking_off_budget, incomplete_split) as pending, so the transactions pre-flight doesn't
+    abort on them. Their LM ids aren't needed to bucket transactions — only the payload uses
+    them, and dry-run never sends payloads. Regular categories and groups need no handling at
+    all: a transaction's bucket is decided by its YNAB category semantics, not by whether the
+    LM id is resolved yet."""
+    for item in plan:
+        if item["action"] in (_SC_CREATE, _SC_RECOVER):
+            sync.mark_provisional("special_categories", item["key"])
+
+
 def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir: Path,
                      apply: bool, confirm_each: bool = False) -> int:
     """Plan and optionally execute category + category-group sync. Returns count of changes."""
@@ -1499,6 +1536,7 @@ def phase_categories(data_dir: Path, client: LMClient, sync: SyncState, sync_dir
         return 0
 
     if not apply:
+        _mark_pending_special_cats(plan, sync)
         print(f"\n  {DIM}(dry-run — pass --apply to apply){RESET}")
         return len(actionable)
 
@@ -1792,8 +1830,10 @@ def phase_transactions(
     ynab_txns: list[dict[str, Any]] = load_json(data_dir, "transactions")
     ynab_accounts: list[dict[str, Any]] = load_json(data_dir, "accounts")
 
-    # Pre-flight
-    errors = preflight_check(ynab_txns, ynab_accounts, sync)
+    # Pre-flight. Special categories that would be created earlier in this same dry-run are
+    # treated as satisfied (marked pending by the categories phase) so the preview can proceed.
+    errors = preflight_check(ynab_txns, ynab_accounts, sync,
+                             pending_special_cats=sync.provisional_special_cats())
     if errors:
         if on_missing == "abort":
             print(f"\n  {RED}Pre-flight failed:{RESET}")

@@ -424,3 +424,89 @@ def test_preflight_fails_missing_payment_transfer():
     txns = [make_txn()]
     errors = preflight_check(txns, accts, sync)
     assert any("payment_transfer" in e or "Payment, Transfer" in e for e in errors)
+
+
+# ── dry-run preview: would-be-created entities, no fabricated ids ─────────────
+
+NEW_ACCT_ID = "ynab-acct-new"
+
+
+def _sync_with_new_account_txn(*, off_budget: bool = True):
+    """Base sync (knows acct 101 + special cats) plus YNAB data for a brand-new account that
+    is NOT yet in sync_state, with a transaction on it using an unmapped category."""
+    sync, accts = _base_sync()
+    accts = accts + [{"id": NEW_ACCT_ID, "name": "Lambda Carta Stock",
+                      "on_budget": not off_budget, "deleted": False, "type": "otherAsset"}]
+    txns = [make_txn(id="t-new", account_id=NEW_ACCT_ID,
+                     category_id="ynab-cat-unmapped", category_name="Some Category")]
+    return sync, accts, txns
+
+
+def test_preflight_fails_for_unregistered_new_account():
+    sync, accts, txns = _sync_with_new_account_txn()
+    errors = preflight_check(txns, accts, sync)
+    assert any(NEW_ACCT_ID in e or "Lambda Carta Stock" in e for e in errors)
+
+
+def test_provisional_account_with_none_id_passes_preflight_and_buckets():
+    """A would-be-created account registered with lm_id=None (no fabricated id) lets the
+    transactions phase preview: pre-flight passes and the txn buckets correctly, with the
+    account id left unresolved (None) in the insert payload."""
+    sync, accts, txns = _sync_with_new_account_txn(off_budget=True)
+    sync.set_account(NEW_ACCT_ID, lm_type="manual", lm_id=None, lm_name="Lambda Carta Stock")
+    sync.mark_provisional("accounts", NEW_ACCT_ID)
+
+    assert preflight_check(txns, accts, sync) == []
+
+    plan = build_transaction_plan(txns, accts, sync=sync, options=TxnImportOptions())
+    item = plan.items[0]
+    assert item.bucket == "tracking"          # off-budget → tracking, decided without an id
+    assert item.insert.manual_account_id is None  # id stays unresolved, not fabricated
+
+
+def test_unmapped_category_still_buckets_as_spending():
+    """Bucket comes from YNAB category semantics, not from whether the LM id resolves — an
+    on-budget txn whose category isn't mapped yet still counts as spending, not uncategorized."""
+    sync, accts, txns = _sync_with_new_account_txn(off_budget=False)
+    sync.set_account(NEW_ACCT_ID, lm_type="manual", lm_id=None, lm_name="X")
+    sync.mark_provisional("accounts", NEW_ACCT_ID)
+    plan = build_transaction_plan(txns, accts, sync=sync, options=TxnImportOptions())
+    item = plan.items[0]
+    assert item.bucket == "spending"
+    assert item.insert.category_id is None
+
+
+def test_preflight_passes_with_pending_special_cat():
+    """A special category that would be created later this run is treated as satisfied."""
+    sync = make_sync(
+        accounts={YNAB_ACCT_ID: {"lm_type": "manual", "lm_id": 101, "lm_name": "A1"}},
+        special_cats={},  # payment_transfer missing...
+    )
+    accts = [{"id": YNAB_ACCT_ID, "name": "A1", "on_budget": True, "deleted": False}]
+    txns = [make_txn()]
+    assert preflight_check(txns, accts, sync)  # ...so it fails by default
+    sync.mark_provisional("special_categories", "payment_transfer")
+    assert preflight_check(txns, accts, sync,
+                           pending_special_cats=sync.provisional_special_cats()) == []
+
+
+def test_save_strips_provisional_entries(tmp_path):
+    """Provisional preview entries (account with None id, pending special cat) must never be
+    written to sync_state.json; real entries must persist."""
+    import json
+    from sync_state import SyncState, SyncStateData
+    s = SyncState(SyncStateData(ynab_budget_id="b", ynab_budget_name="B",
+                                lm_account_id=1, currency="cad"))
+    s.set_account("real", lm_type="manual", lm_id=500, lm_name="Real")
+    s.set_account("prov", lm_type="manual", lm_id=None, lm_name="Provisional")
+    s.mark_provisional("accounts", "prov")
+    s.mark_provisional("special_categories", "payment_transfer")
+    # In-memory lookups still see provisional entries (so the preview works this run):
+    assert s.account("prov").lm_id is None
+    assert "payment_transfer" in s.provisional_special_cats()
+
+    s.save(tmp_path)
+    saved = json.loads((tmp_path / "sync_state.json").read_text())
+    assert "real" in saved["accounts"]
+    assert "prov" not in saved["accounts"]
+    assert "payment_transfer" not in saved["special_categories"]
