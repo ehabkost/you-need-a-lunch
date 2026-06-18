@@ -1,5 +1,17 @@
 # Transaction Update Plan
 
+> **✅ DONE — historical archive (as of 2026-06-17).** Transaction update support is
+> implemented and tested (`tests/test_transaction_updates.py`, 54 passing). The shipped design
+> is **[Revision 2](#revision-2-2026-06-12-drop-lm_hash-split-sync-from-reconcile)** — read that
+> section for what the code actually does. **Everything from the original "two-hash" design below
+> Revision 2 (lines from ["Background and design decisions"](#background-and-design-decisions)
+> onward) is superseded and does NOT match the code:** `lm_hash`/`lm_recurring`, the
+> `conflict`/`skipped_lm_edited`/`skipped_ynab_unmapped` buckets, `--force-ynab`, and
+> `--rebuild-index` were dropped or renamed (sync is offline; LM read-back lives in the
+> read-only `reconcile` subcommand). The retained-and-implemented pieces — `compute_ynab_hash`,
+> the split inplace/structural mechanics, and the crash-resistance ordering — survive Rev 2 as
+> noted there. Kept for design history only; not a current reference.
+
 This is a complete implementation plan for an agent to implement transaction update support:
 detecting YNAB changes to already-imported transactions and propagating them to Lunch Money,
 while preserving user edits made directly in LM (one-way sync).
