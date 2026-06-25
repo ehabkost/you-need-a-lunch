@@ -1,5 +1,9 @@
 # Migration Plan: YNAB → Lunch Money
 
+> **For current status, priority, and sequencing of every phase, see [ROADMAP.md](ROADMAP.md)**
+> (the authority for what is done / next / blocked / deferred). This doc describes the *design*
+> of each phase.
+
 ## Overview
 
 The migration is structured in phases, with each phase building on previous work. Importers must always show a dry-run summary before applying changes.

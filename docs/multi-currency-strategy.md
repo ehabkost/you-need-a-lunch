@@ -4,6 +4,11 @@ How cross-currency holdings have been tracked in YNAB, and how the importer shou
 
 This document is more specific than [multi-budget.md](multi-budget.md) (which covers generic per-account exclusion and one-budget-to-many-LM-accounts mechanics). When the two disagree, prefer this one for currency-related decisions.
 
+> **Status: the "two YNAB budgets → one LM account" piece is 🔭 v2 — see [ROADMAP.md](ROADMAP.md).**
+> Despite the "in scope for v1" wording later in this doc, that work is **moved to v2** (gated
+> on unresolved Q2 below + the category-separation decision). The CAD-budget BRL-proxy
+> *exclusion* rules remain part of v1.
+
 ## Current YNAB-side reality
 
 There are **two** YNAB budgets:

@@ -1,5 +1,9 @@
 # Date-Range Filtering: --since Option
 
+> **Status: 💤 deferred (maybe-one-day) — see [ROADMAP.md](ROADMAP.md).** Plumbing partly
+> exists, but partial import is not a focus; full-history import is the default path. The
+> opening-balance story below is unfinished (see ROADMAP Gap §2 — double-count risk).
+
 ## Overview
 
 The importer supports a `--since DATE` option (e.g. `--since 2023-01-01` or `--since 6mo` or `--since 2y`) that restricts which data gets imported. This is the primary way to do a partial migration — e.g. "only bring in the last 2 years" — without importing the full history.

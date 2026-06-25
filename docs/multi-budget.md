@@ -1,5 +1,8 @@
 # Multi-Budget Scenarios
 
+> **Status: the "two budgets → one LM account" piece is 🔭 v2 — see [ROADMAP.md](ROADMAP.md).**
+> The per-account exclude mechanism and per-LM-account sync-state layout below are v1.
+
 ## BRL Accounts in the CAD Budget
 
 The CAD YNAB budget contains BRL accounts that were only used to represent BRL balances — they are not real CAD accounts. There is a separate BRL YNAB budget that will eventually be imported into Lunch Money independently.

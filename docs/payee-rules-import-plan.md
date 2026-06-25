@@ -1,5 +1,9 @@
 # Payee Rules Import Plan
 
+> **Status: 🔭 v2, deferred — see [ROADMAP.md](ROADMAP.md).** Demoted from "Phase 0.5": it
+> needs Playwright UI automation + email/password creds (no LM rules API), a brittler risk
+> class than the API-clean importers. Revisit after v1.
+
 ## Source data
 
 `data/tmp/ynab-catalog.json` (captured from YNAB internal API — see `docs/ynab-internal-catalog-api.md`).
@@ -133,9 +137,10 @@ Add to `requirements.txt` + install in `.venv`:
 
 ## Phase placement
 
-This is a new **Phase 0.5** — runs after Phase 0 (accounts + categories, which creates `sync_state` with `special_categories.payment_transfer`) but before Phase 1 (transactions). That way the rules are in place when transactions are imported and LM can apply them to any newly-synced Plaid transactions going forward.
-
-Alternatively, run it after Phase 1 since it doesn't affect the import of historical YNAB transactions (those already have correct payee names). The rules only matter for future Plaid-synced transactions.
+**Deferred to v2** (see [ROADMAP.md](ROADMAP.md)). When picked up: it only matters for
+*future* Plaid-synced transactions (historical YNAB transactions already carry correct payee
+names), so it can run any time after Phase 0 creates `sync_state` with
+`special_categories.payment_transfer` — there is no need to slot it before Phase 1.
 
 ## Open questions
 

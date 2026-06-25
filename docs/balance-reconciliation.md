@@ -1,5 +1,9 @@
 # Balance Reconciliation Strategy
 
+> **Status: 🔭 high-priority v1, not yet implemented — see [ROADMAP.md](ROADMAP.md).** This is
+> the next thing to build after Phase 1. It is *not* the existing `reconcile` command (that
+> does per-transaction field-diff, not balances).
+
 ## Goal
 
 Lunch Money account balances should match YNAB after import.

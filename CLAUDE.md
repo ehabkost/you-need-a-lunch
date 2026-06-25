@@ -62,6 +62,12 @@ See **[docs/api-reference.md](docs/api-reference.md)** for details on YNAB and L
 - Authentication and rate limits
 - Account types and metadata storage
 
+## Roadmap
+
+See **[docs/ROADMAP.md](docs/ROADMAP.md)** for current status, priority, and sequencing of
+every phase/feature (what is done / next / blocked / deferred). It is the authority when a
+feature doc disagrees about priority or milestone.
+
 ## Migration Plan
 
 See **[docs/migration-plan.md](docs/migration-plan.md)** for the detailed phased plan:
