@@ -91,6 +91,37 @@ This tool periodically audits the category to catch drift:
 
 This is a maintenance tool, not part of import — run it on demand or on a schedule against the live LM account.
 
+## Goals Service (recreates YNAB goals on top of LM's amount-only budget API)
+
+LM has no goals concept at all, in the UI or the API — see
+[ROADMAP.md Gap §6](ROADMAP.md) for the full finding. `PUT /budgets` only ever accepts a
+literal `amount` per category per period (confirmed on both v1 and v2); there's no way to
+store a target amount, a target date, or a recurring cadence LM will compute for you. Anyone
+who relied on YNAB goals loses that UX on migration.
+
+Idea: a separate, standalone service (not part of the migration tool, and not gated on
+YNAB at all after the initial one-time import) that:
+
+- Lets the user define goals directly (target amount, optional target date, cadence —
+  monthly/yearly/one-off), independent of YNAB, stored in its own local state.
+- On a schedule (e.g. a cron run at the start of each budget period), computes what each
+  goal implies for the *current* period's amount — the same "target-by-date → this period's
+  contribution" math YNAB's goal engine does — and calls `PUT /budgets` to write that
+  `amount` for the relevant category.
+- Effectively reimplements YNAB's goal-to-assignment computation client-side, since LM's
+  `auto_budget_type`/`config.auto_suggest` presets can be *read* but not *set* via API (Gap
+  §1) — so this service can't configure LM's own preset engine, it has to replace it: compute
+  the amount itself every period and push it directly.
+
+This is explicitly **not** a migration-phase deliverable — it depends on Phase 2 (`PUT
+/budgets` usage patterns, auth, category-id resolution) but is designed to keep running
+indefinitely after migration is done, as its own tool with its own scheduling. No design
+work done yet: open questions include where goal definitions live (local file vs. LM
+`custom_metadata`? categories have no `external_id` to hang extra state off, so probably a
+local file), what happens to a goal when its category is renamed/archived in LM, and how to
+surface "goal underfunded this period" back to the user (dry-run summary before writing, same
+as the importer's pattern).
+
 ## Account-Merging Helper Tool
 
 LM supports merging accounts ([Managing Accounts](https://support.lunchmoney.app/setup/accounts/managing-accounts)), and the multi-currency strategy assumes the user will restructure accounts after import. Doing this by hand is risky for an imported budget: the source account's `external_id` and `custom_metadata` may or may not survive the merge (unverified — see open question in [transaction-import-plan.md](transaction-import-plan.md)), which breaks future re-sync.
