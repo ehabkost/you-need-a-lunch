@@ -18,7 +18,7 @@ data/       # intermediate export files (gitignored)
 
 ## Secrets and Authentication
 
-All tools must read secrets exclusively from environment variables — no config files, no hardcoded values, no interactive prompts for credentials. Secrets are injected via `wsl-op-run` using the wrapper scripts:
+All tools must read secrets exclusively from environment variables — no config files, no hardcoded values, no interactive prompts for credentials. Secrets are injected with 1Password's `op run` using the wrapper scripts:
 
 ```sh
 ./prod-run.sh python ynab/export.py       # uses .env.production
