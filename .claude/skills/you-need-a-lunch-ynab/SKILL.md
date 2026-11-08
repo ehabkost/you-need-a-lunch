@@ -1,9 +1,13 @@
 ---
-name: ynab-api
+name: you-need-a-lunch-ynab
 description: Work with the YNAB (You Need A Budget) REST API from scripts - read budgets/plans, accounts, categories, payees, transactions, months, scheduled transactions, or write/update transactions. Use when the user asks to query, export, annotate or automate YNAB, or asks about YNAB data semantics (milliunits, sign, import_id, delta sync, internal categories, transfers, credit cards, debt accounts). Points to the you-need-a-lunch docs and code that already cover YNAB.
 ---
 
-# YNAB API
+# YNAB API: you-need-a-lunch docs and code
+
+The generic `ynab-api` skill (personal, in dotfiles) covers setup with `op run`, OFX/CSV
+matching and `ynab-check-missing`. This one is the project-specific map of what this repo
+already documents and implements; use both.
 
 Public REST API v1: base `https://api.ynab.com/v1`, `Authorization: Bearer <token>`,
 **200 requests/hour per token** (HTTP 429 with `Retry-After`). Per-resource field lists are in
