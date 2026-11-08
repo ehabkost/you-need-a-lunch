@@ -3,4 +3,6 @@ data/
 __pycache__/
 .env.*
 memory/
-.claude/
+.claude/settings.local.json
+.claude/shellgate
+.claude/worktrees/
