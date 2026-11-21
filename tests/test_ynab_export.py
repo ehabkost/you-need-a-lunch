@@ -90,3 +90,59 @@ def test_resolve_since_forces_full_when_file_missing(tmp_path: Path) -> None:
     assert ynab_export._resolve_since(tmp_path, "categories", checkpoint, "categories") == 5603
     # No cursor at all -> None
     assert ynab_export._resolve_since(tmp_path, "categories", {}, "categories") is None
+
+
+class _FakeClient:
+    """Records get() calls and returns an empty list for every resource."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int | None, dict | None]] = []
+        self.request_count = 0
+
+    def get(self, path, *, since=None, params=None, allow_404=False):
+        self.calls.append((path, since, params))
+        key = path.rstrip("/").split("/")[-1]
+        data = {key: [], "server_knowledge": 7}
+        if key == "categories":
+            data = {"category_groups": [], "server_knowledge": 7}
+        return {"data": data}
+
+
+def _budget() -> dict:
+    return {"name": "Test", "currency_format": {"iso_code": "CAD"}}
+
+
+def _transactions_call(client: _FakeClient) -> tuple:
+    return next(c for c in client.calls if c[0].endswith("/transactions"))
+
+
+def test_transactions_request_full_history(tmp_path: Path) -> None:
+    """API v1.85.0 defaults since_date to one year ago; the export must override it."""
+    client = _FakeClient()
+    ynab_export.run_export(client, "B", _budget(), tmp_path, update=False)
+
+    _, since, params = _transactions_call(client)
+    assert since is None
+    assert params == {"since_date": ynab_export.FULL_HISTORY_SINCE_DATE}
+    ck = ynab_export.load_checkpoint(tmp_path)
+    assert ck[ynab_export.TRANSACTIONS_FULL_HISTORY] is True
+
+
+def test_old_checkpoint_refetches_transactions_in_full(tmp_path: Path) -> None:
+    """A checkpoint written before the fix lacks the flag: transactions are re-fetched in
+    full once, then deltas resume (still with since_date)."""
+    client = _FakeClient()
+    ynab_export.run_export(client, "B", _budget(), tmp_path, update=False)
+    ck = ynab_export.load_checkpoint(tmp_path)
+    del ck[ynab_export.TRANSACTIONS_FULL_HISTORY]
+    ynab_export.save_checkpoint(tmp_path, ck)
+
+    client = _FakeClient()
+    ynab_export.run_export(client, "B", _budget(), tmp_path, update=True)
+    assert _transactions_call(client)[1] is None  # full
+
+    client = _FakeClient()
+    ynab_export.run_export(client, "B", _budget(), tmp_path, update=True)
+    _, since, params = _transactions_call(client)
+    assert since == 7
+    assert params == {"since_date": ynab_export.FULL_HISTORY_SINCE_DATE}

@@ -50,7 +50,7 @@ elsewhere. Never print or commit the token; for curl use the `op-run` skill. Mis
 | Older YNAB4 history | `docs/ynab4-historical-import-idea.md` |
 | Date-range / `--since` handling | `docs/date-filtering.md` |
 | Project status and priorities | `docs/ROADMAP.md`, `docs/migration-plan.md`, `CLAUDE.md` |
-| Existing YNAB API client with 429 retry and delta sync | `ynab/export.py` (`YNABClient`, checkpoint of `server_knowledge`). Known gap: it sends no `since_date`, so since v1.85.0 transaction exports only cover the last year |
+| Existing YNAB API client with 429 retry and delta sync | `ynab/export.py` (`YNABClient`, checkpoint of `server_knowledge`). Transactions are always fetched with `since_date=1900-01-01` (`FULL_HISTORY_SINCE_DATE`) because of the v1.85.0 default |
 | Viewing exported data | `ynab/view.py` |
 | Live probes of write behaviour (pattern for testing safely) | `scripts/probe_put_notes.py`, `scripts/probe_recurring_reinsert.py` |
 | Another working YNAB client (read + PATCH/split memos) | `lib/ynab_amazon.py` and `bin/ynab-amazon` in the life repo; `ynab-amazon` skill |

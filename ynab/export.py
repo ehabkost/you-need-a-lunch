@@ -15,12 +15,21 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_URL = "https://api.ynab.com/v1"
 CHECKPOINT_FILE = "checkpoint.json"
+
+# Since API v1.85.0 the transaction lists default to `since_date` = one year ago, even in
+# delta mode (`last_knowledge_of_server`). Always send an explicit early date so exports
+# (and deltas, which would otherwise skip changes to older transactions) cover all history.
+FULL_HISTORY_SINCE_DATE = "1900-01-01"
+# Checkpoint flag: the stored transactions were fetched with FULL_HISTORY_SINCE_DATE.
+# Exports made before the fix lack it and get one full transactions re-fetch.
+TRANSACTIONS_FULL_HISTORY = "transactions_full_history"
 
 
 def get_env(name):
@@ -38,10 +47,14 @@ class YNABClient:
         self._token = token
         self.request_count = 0
 
-    def get(self, path, *, since: int | None = None, allow_404=False):
+    def get(self, path, *, since: int | None = None, params: dict | None = None,
+            allow_404=False):
         url = f"{BASE_URL}{path}"
+        query = dict(params or {})
         if since is not None:
-            url += f"?last_knowledge_of_server={since}"
+            query["last_knowledge_of_server"] = since
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._token}"})
         try:
             with urllib.request.urlopen(req) as resp:
@@ -52,7 +65,7 @@ class YNABClient:
                 wait = int(e.headers.get("Retry-After", 60))
                 print(f"    rate limited — waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
-                return self.get(path, since=since, allow_404=allow_404)
+                return self.get(path, since=since, params=params, allow_404=allow_404)
             if e.code == 404 and allow_404:
                 return None
             body = e.read().decode()
@@ -156,10 +169,10 @@ def _resolve_since(out_dir: Path, name: str, checkpoint: dict, ck_key: str) -> i
 
 
 def fetch_simple(client, path, data_key, out_dir, name, checkpoint, ck_key, *,
-                 allow_404=False, merge_fn=merge_by_id):
+                 allow_404=False, merge_fn=merge_by_id, params=None):
     """Fetch a simple list endpoint, merge with existing, update checkpoint."""
     since = _resolve_since(out_dir, name, checkpoint, ck_key)
-    resp = client.get(path, since=since, allow_404=allow_404)
+    resp = client.get(path, since=since, params=params, allow_404=allow_404)
     if resp is None:
         print(f"  (not available)")
         return
@@ -239,8 +252,13 @@ def run_export(client: YNABClient, budget_id: str, budget: dict, out_dir: Path, 
                  out_dir, "categories", checkpoint, "categories", merge_fn=merge_categories)
 
     print("Transactions...")
+    if not checkpoint.get(TRANSACTIONS_FULL_HISTORY) and "transactions" in checkpoint:
+        print("  (stored transactions may lack history older than a year — full re-fetch)")
+        del checkpoint["transactions"]
     fetch_simple(client, f"/budgets/{budget_id}/transactions", "transactions",
-                 out_dir, "transactions", checkpoint, "transactions")
+                 out_dir, "transactions", checkpoint, "transactions",
+                 params={"since_date": FULL_HISTORY_SINCE_DATE})
+    checkpoint[TRANSACTIONS_FULL_HISTORY] = True
 
     print("Scheduled transactions...")
     fetch_simple(client, f"/budgets/{budget_id}/scheduled_transactions", "scheduled_transactions",
